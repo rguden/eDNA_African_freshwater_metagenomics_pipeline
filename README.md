@@ -1,11 +1,13 @@
 # African Freshwater eDNA Shotgun Metagenomics Pipeline
 A modular Bash/SLURM workflow for processing Illumina paired-end environmental DNA (eDNA) shotgun metagenomes from African freshwater systems.
----
+
 Pipeline script: `eDNA_Africa_freshwater.sh`  
 Author: Rodgee Mae Guden
----
-Project context: African freshwater eDNA research conducted in collaboration between KU Leuven and the Royal Museum for Central Africa (RMCA)  
+
+Project context: African freshwater eDNA research conducted in collaboration between KU Leuven and the Royal Museum for Central Africa (RMCA)
+
 README version: 0.1 — 28 July 2026
+
 ---
 ## 1. Overview
 
