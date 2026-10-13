@@ -24,7 +24,7 @@ the robustness of community-level biodiversity inference.
 The script does not process the complementary metabarcoding dataset. It is specifically designed for shotgun metagenomic libraries.
 
 ---
-## 2. Recommended workflow
+## 2. Workflow
 ```mermaid
 flowchart TD
     A[Paired raw FASTQ files] --> B[FastQC]
