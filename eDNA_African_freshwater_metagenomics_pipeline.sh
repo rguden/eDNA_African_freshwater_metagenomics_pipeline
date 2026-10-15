@@ -41,7 +41,8 @@ while getopts "s:" opt; do
 done
 
 if [ ${#STEPS[@]} -eq 0 ]; then
-    STEPS=(read_counts)
+    echo "Usage: $0 -s <step1,step2,...>" >&2
+    exit 2
 fi
 
 log "Steps to run: ${STEPS[*]}"
@@ -176,9 +177,40 @@ count_reads() {
 }
 
 # -------------------- GET SAMPLE LIST --------------------
-mapfile -t R1_FILES < <(ls "$READS_DIR"/*_R1*.fastq.gz | sort)
+if [[ -n "${DEDUP_SAMPLES:-}" ]]; then
+
+    read -ra SAMPLE_LIST <<< "$DEDUP_SAMPLES"
+
+    R1_FILES=()
+
+    for SAMPLE in "${SAMPLE_LIST[@]}"; do
+
+        R1="$READS_DIR/${SAMPLE}_R1.fastq.gz"
+
+        if [[ ! -s "$R1" ]]; then
+            log "ERROR: Missing R1 file for $SAMPLE → $R1"
+            exit 1
+        fi
+
+        R1_FILES+=("$R1")
+
+    done
+
+else
+
+    # Default behaviour: process all samples
+    mapfile -t R1_FILES < <(
+        find "$READS_DIR" -maxdepth 1 \
+            -type f \
+            -name '*_R1*.fastq.gz' \
+            | sort
+    )
+
+fi
 
 N=${#R1_FILES[@]}
+
+log "Number of samples selected for dedup: $N"
 
 # -------------------- CHECK ARRAY INDEX --------------------
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
@@ -285,8 +317,48 @@ count_reads() {
 }
 
 # -------------------- GET SAMPLE LIST --------------------
-mapfile -t R1_FILES < <(ls "$DEDUP_DIR"/*_dedup_R1.fastq.gz | sort)
+if [[ -n "${TRIM_SAMPLES:-}" ]]; then
+
+    # Use only explicitly requested samples
+    read -ra SAMPLE_LIST <<< "$TRIM_SAMPLES"
+
+    R1_FILES=()
+
+    for SAMPLE in "${SAMPLE_LIST[@]}"; do
+
+        R1="$DEDUP_DIR/${SAMPLE}_dedup_R1.fastq.gz"
+        R2="$DEDUP_DIR/${SAMPLE}_dedup_R2.fastq.gz"
+
+        # Check both paired files before adding sample
+        if [[ ! -s "$R1" ]]; then
+            log "ERROR: Missing R1 for $SAMPLE → $R1"
+            exit 1
+        fi
+
+        if [[ ! -s "$R2" ]]; then
+            log "ERROR: Missing R2 for $SAMPLE → $R2"
+            exit 1
+        fi
+
+        R1_FILES+=("$R1")
+    done
+
+else
+
+    # Default behaviour: use all deduplicated samples
+    mapfile -t R1_FILES < <(
+        find "$DEDUP_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name '*_dedup_R1.fastq.gz' \
+            | sort
+    )
+
+fi
+
 N=${#R1_FILES[@]}
+
+log "Number of samples selected for trimming: $N"
 
 # -------------------- CHECK ARRAY --------------------
 if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
@@ -652,7 +724,7 @@ log "Finished STANDARD: $SAMPLE"
 ;;
 
 # ============================================================
-# PER-SAMPLE ASSEMBLY (ARRAY-AWARE)
+# PER-SAMPLE ASSEMBLY (ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 assembly_sample)
 
@@ -670,60 +742,130 @@ mkdir -p "$ASM_DIR" "$LOG_DIR"
 
 log "Starting assembly step"
 log "THREADS: $THREADS"
+log "MINLEN: $MINLEN"
 log "TRIM_DIR: $TRIM_DIR"
 
-# -------------------- FILE LIST --------------------
-mapfile -t R1_FILES < <(ls "$TRIM_DIR"/*_trimmed_R1.fastq.gz | sort)
-N=${#R1_FILES[@]}
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
 
-log "Total samples detected: $N"
+if [[ -n "${SAMPLE:-}" ]]; then
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    R1="$TRIM_DIR/${SAMPLE}_trimmed_R1.fastq.gz"
+    R2="$TRIM_DIR/${SAMPLE}_trimmed_R2.fastq.gz"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t R1_FILES < <(
+        find "$TRIM_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*_trimmed_R1.fastq.gz" \
+            | sort
+    )
+
+    N=${#R1_FILES[@]}
+
+    log "Total samples detected: $N"
+
+    # -------------------- CHECK FILE LIST --------------------
+    if [[ "$N" -eq 0 ]]; then
+        log "ERROR: No trimmed R1 files found in:"
+        log "$TRIM_DIR"
+        exit 1
+    fi
+
+    # -------------------- CHECK ARRAY --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    R1="${R1_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+    R2="${R1/_R1.fastq.gz/_R2.fastq.gz}"
+
+    SAMPLE=$(basename "$R1" | sed -E 's/_trimmed_R1.*//')
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
+# ============================================================
+# INPUT CHECK
+# ============================================================
 
-# -------------------- SELECT SAMPLE --------------------
-R1="${R1_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-R2="${R1/_R1.fastq.gz/_R2.fastq.gz}"
-SAMPLE=$(basename "$R1" | sed -E 's/_trimmed_R1.*//')
+[[ -s "$R1" ]] || {
+    log "ERROR: Missing or empty R1:"
+    log "$R1"
+    exit 1
+}
+
+[[ -s "$R2" ]] || {
+    log "ERROR: Missing or empty R2:"
+    log "$R2"
+    exit 1
+}
+
+# ============================================================
+# OUTPUT FILES
+# ============================================================
 
 OUTDIR="$ASM_DIR/$SAMPLE"
+
 CONTIGS="$OUTDIR/final.contigs.fa"
 FINAL="$OUTDIR/${SAMPLE}.contigs.fa"
 
 log "----------------------------------------"
 log "Processing sample: $SAMPLE"
+log "R1: $R1"
+log "R2: $R2"
+log "Output directory: $OUTDIR"
 
-# -------------------- INPUT CHECK --------------------
-[[ -s "$R1" && -s "$R2" ]] || {
-    log "ERROR: Missing reads:"
-    log "R1: $R1"
-    log "R2: $R2"
-    exit 1
-}
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
 
-# -------------------- SKIP IF DONE --------------------
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
 if [[ -s "$FINAL" && "${FORCE:-0}" != "1" ]]; then
-    log "Assembly exists → skipping"
+    log "Assembly already exists -> skipping"
+    log "$FINAL"
     exit 0
 fi
 
-# -------------------- CLEAN OLD RUN --------------------
+# ============================================================
+# CLEAN OLD/INCOMPLETE RUN
+# ============================================================
+
 if [[ -d "$OUTDIR" ]]; then
-    log "Removing existing directory: $OUTDIR"
+    log "Removing existing assembly directory:"
+    log "$OUTDIR"
     rm -rf "$OUTDIR"
 fi
 
-# DO NOT create OUTDIR — MEGAHIT will do it
+# Do not mkdir OUTDIR.
+# MEGAHIT requires the output directory not to already exist.
 
-# -------------------- RUN MEGAHIT --------------------
+# ============================================================
+# RUN MEGAHIT
+# ============================================================
+
 log "Running MEGAHIT"
 
 megahit \
@@ -735,30 +877,57 @@ megahit \
     -o "$OUTDIR" \
     &>> "$LOG_DIR/${SAMPLE}.log"
 
-# -------------------- VALIDATE --------------------
+# ============================================================
+# VALIDATE ASSEMBLY
+# ============================================================
+
 [[ -s "$CONTIGS" ]] || {
-    log "ERROR: Assembly failed"
+    log "ERROR: Assembly failed or final.contigs.fa is empty"
+    log "Check:"
+    log "$LOG_DIR/${SAMPLE}.log"
     exit 1
 }
 
-# -------------------- RENAME --------------------
+# ============================================================
+# RENAME CONTIG HEADERS
+# ============================================================
+
 TMP="$OUTDIR/${SAMPLE}.renamed.fa"
 
 awk -v s="$SAMPLE" '
-/^>/ {gsub(/^>/,"",$0); print ">" s "_" $0; next}
-{print}
+/^>/ {
+    sub(/^>/, "", $0)
+    print ">" s "_" $0
+    next
+}
+{
+    print
+}
 ' "$CONTIGS" > "$TMP"
 
+# Rename the prefixed-contig file to the final sample-specific name
 mv "$TMP" "$FINAL"
 
-# Optional: keep original but link it
+# Replace MEGAHIT final.contigs.fa with a symlink to the
+# sample-specific renamed assembly
 ln -sfn "$(basename "$FINAL")" "$CONTIGS"
 
-log "Finished: $FINAL"
+# ============================================================
+# FINAL CHECK
+# ============================================================
+
+[[ -s "$FINAL" ]] || {
+    log "ERROR: Final renamed assembly not created"
+    exit 1
+}
+
+log "Assembly completed"
+log "Final assembly: $FINAL"
+
 ;;
 
 # ============================================================
-# PER-SAMPLE MAPPING (ARRAY-AWARE)
+# PER-SAMPLE MAPPING (ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 mapping)
 
@@ -769,129 +938,240 @@ THREADS="${THREADS:-8}"
 
 MAP_DIR="$OUTPUT_DIR/mapping"
 LOG_DIR="$OUTPUT_DIR/logs/mapping"
+
 mkdir -p "$MAP_DIR" "$LOG_DIR"
 
 log "Starting mapping step (BBMap)"
 log "THREADS: $THREADS"
 
-# -------------------- TMPDIR VALIDATION --------------------
+# ============================================================
+# TMPDIR VALIDATION
+# ============================================================
+
 if [[ -z "${TMPDIR:-}" || ! -d "$TMPDIR" ]]; then
     log "ERROR: TMPDIR not set or not a directory"
     exit 1
 fi
 
-# Test write permission
+# Test whether TMPDIR is writable
 touch "$TMPDIR/.tmp_test_${SLURM_JOB_ID}" 2>/dev/null || {
     log "ERROR: TMPDIR not writable: $TMPDIR"
     exit 1
 }
+
 rm -f "$TMPDIR/.tmp_test_${SLURM_JOB_ID}"
 
-# Check free space (require ~20 GB; adjust if needed)
+# Check available temporary space
 FREE_GB=$(df -BG "$TMPDIR" | awk 'NR==2{gsub("G","",$4); print $4}')
-MIN_GB=${TMP_MIN_GB:-20}
-if [[ "$FREE_GB" -lt "$MIN_GB" ]]; then
+MIN_GB="${TMP_MIN_GB:-20}"
+
+if (( FREE_GB < MIN_GB )); then
     log "ERROR: TMPDIR has only ${FREE_GB}G free (< ${MIN_GB}G required)"
     exit 1
 fi
 
-# Create per-job working dir
+# Per-job working directory
 WORKDIR="$TMPDIR/map_${SLURM_JOB_ID}"
+
 mkdir -p "$WORKDIR"
 
 log "Using TMPDIR: $TMPDIR"
-log "WORKDIR: $WORKDIR (free ${FREE_GB}G)"
+log "WORKDIR: $WORKDIR"
+log "TMP free space: ${FREE_GB}G"
 
-# -------------------- TOOL CHECK --------------------
-command -v bbmap.sh >/dev/null || { log "ERROR: bbmap.sh not found"; exit 1; }
-command -v samtools  >/dev/null || { log "ERROR: samtools not found"; exit 1; }
+# ============================================================
+# TOOL CHECK
+# ============================================================
 
-# -------------------- COLLECT ASSEMBLIES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$OUTPUT_DIR/assembly"/*; do
-        [[ -d "$d" ]] || continue
-        s=$(basename "$d")
-        f="$d/${s}.contigs.fa"
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
-
-N=${#ASM_FILES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No valid assemblies found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$ASM" | sed 's/.contigs.fa//')
-
-R1="$OUTPUT_DIR/trimmed/${SAMPLE}_trimmed_R1.fastq.gz"
-R2="$OUTPUT_DIR/trimmed/${SAMPLE}_trimmed_R2.fastq.gz"
-BAM="$MAP_DIR/${SAMPLE}.bam"
-
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
-log "ASM: $ASM"
-log "R1:  $R1"
-log "R2:  $R2"
-
-# -------------------- INPUT CHECK --------------------
-[[ -s "$ASM" ]] || { log "ERROR: Assembly missing"; exit 1; }
-[[ -s "$R1" && -s "$R2" ]] || {
-    log "ERROR: Missing reads"
-    log "R1 exists? $( [[ -s "$R1" ]] && echo YES || echo NO )"
-    log "R2 exists? $( [[ -s "$R2" ]] && echo YES || echo NO )"
+command -v bbmap.sh >/dev/null || {
+    log "ERROR: bbmap.sh not found"
     exit 1
 }
 
-# -------------------- SKIP --------------------
-if [[ -s "$BAM" && "${FORCE:-0}" != "1" ]]; then
-    log "Mapping exists → skipping"
+command -v samtools >/dev/null || {
+    log "ERROR: samtools not found"
+    exit 1
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    ASM="$OUTPUT_DIR/assembly/$SAMPLE/${SAMPLE}.contigs.fa"
+
+    [[ -s "$ASM" ]] || {
+        log "ERROR: Missing assembly:"
+        log "$ASM"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$OUTPUT_DIR/assembly" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.fa" \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total assemblies detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No assemblies found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.fa)
+
+fi
+
+# ============================================================
+# SAMPLE FILES
+# ============================================================
+
+R1="$OUTPUT_DIR/trimmed/${SAMPLE}_trimmed_R1.fastq.gz"
+R2="$OUTPUT_DIR/trimmed/${SAMPLE}_trimmed_R2.fastq.gz"
+
+BAM="$MAP_DIR/${SAMPLE}.bam"
+BAI="$BAM.bai"
+
+log "----------------------------------------"
+log "Processing sample: $SAMPLE"
+log "Assembly: $ASM"
+log "R1: $R1"
+log "R2: $R2"
+log "BAM: $BAM"
+
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
+
+# ============================================================
+# INPUT CHECK
+# ============================================================
+
+[[ -s "$ASM" ]] || {
+    log "ERROR: Missing assembly:"
+    log "$ASM"
+    exit 1
+}
+
+[[ -s "$R1" ]] || {
+    log "ERROR: Missing R1:"
+    log "$R1"
+    exit 1
+}
+
+[[ -s "$R2" ]] || {
+    log "ERROR: Missing R2:"
+    log "$R2"
+    exit 1
+}
+
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
+if [[ -s "$BAM" && -s "$BAI" && "${FORCE:-0}" != "1" ]]; then
+    log "Mapping already completed -> skipping"
+    log "$BAM"
     exit 0
 fi
 
-# -------------------- TMP FILES --------------------
-TMP_PREFIX="$WORKDIR/${SAMPLE}"
+# ============================================================
+# CLEAN PARTIAL OUTPUT
+# ============================================================
+
+if [[ "${FORCE:-0}" == "1" ]]; then
+    log "FORCE=1 -> removing previous BAM and index"
+    rm -f "$BAM" "$BAI"
+fi
+
+# ============================================================
+# TMP FILES
+# ============================================================
+
+TMP_PREFIX="$WORKDIR/$SAMPLE"
+
 TMP_REF="${TMP_PREFIX}.fa"
 TMP_R1="${TMP_PREFIX}_R1.fastq.gz"
 TMP_R2="${TMP_PREFIX}_R2.fastq.gz"
+
 TMP_BAM="${TMP_PREFIX}.bam"
 
 log "Copying inputs to WORKDIR"
+
 cp "$ASM" "$TMP_REF"
 cp "$R1" "$TMP_R1"
 cp "$R2" "$TMP_R2"
 
-# -------------------- THREAD SPLIT --------------------
+# ============================================================
+# THREAD SPLIT
+# ============================================================
+
 BBMAP_THREADS=$((THREADS - 4))
 SORT_THREADS=4
+
 (( BBMAP_THREADS < 1 )) && BBMAP_THREADS=1
 
-# -------------------- MEMORY (dynamic) --------------------
+log "BBMap threads: $BBMAP_THREADS"
+log "samtools sort threads: $SORT_THREADS"
+
+# ============================================================
+# JAVA MEMORY
+# ============================================================
+
 MEM_MB="${SLURM_MEM_PER_NODE:-0}"
-if [[ "$MEM_MB" -gt 0 ]]; then
+
+if (( MEM_MB > 0 )); then
+
     MEM_GB=$((MEM_MB / 1024))
+
+    # Give BBMap 80% of allocated memory
     JAVA_MEM=$((MEM_GB * 80 / 100))
+
 else
+
     JAVA_MEM=16
+
 fi
 
-log "BBMap threads: $BBMAP_THREADS"
-log "Sort threads: $SORT_THREADS"
 log "Java memory: ${JAVA_MEM}g"
 
-# -------------------- RUN BBMAP --------------------
+# ============================================================
+# RUN BBMAP
+# ============================================================
+
 log "Running BBMap"
 
 bbmap.sh \
@@ -904,31 +1184,85 @@ bbmap.sh \
     -Xmx${JAVA_MEM}g \
     out=stdout.sam \
     2>> "$LOG_DIR/${SAMPLE}.log" \
-| samtools view -b - \
+| samtools view \
+    -b \
+    - \
 | samtools sort \
     -@ "$SORT_THREADS" \
     -T "$WORKDIR/${SAMPLE}" \
     -o "$TMP_BAM" \
     2>> "$LOG_DIR/${SAMPLE}.log"
 
-# -------------------- VALIDATE --------------------
-[[ -s "$TMP_BAM" ]] || { log "ERROR: BAM not created"; exit 1; }
+# ============================================================
+# VALIDATE TEMP BAM
+# ============================================================
 
-# -------------------- COPY BACK --------------------
-log "Copying BAM back to output"
+[[ -s "$TMP_BAM" ]] || {
+    log "ERROR: BAM not created"
+    exit 1
+}
+
+# Quick BAM integrity check
+samtools quickcheck "$TMP_BAM" || {
+    log "ERROR: BAM failed samtools quickcheck"
+    exit 1
+}
+
+# ============================================================
+# COPY BACK
+# ============================================================
+
+log "Copying BAM to output directory"
+
 cp "$TMP_BAM" "$BAM"
-samtools index "$BAM"
 
-# -------------------- CLEANUP --------------------
+# ============================================================
+# INDEX BAM
+# ============================================================
+
+log "Indexing BAM"
+
+samtools index \
+    -@ "$SORT_THREADS" \
+    "$BAM"
+
+[[ -s "$BAI" ]] || {
+    log "ERROR: BAM index not created"
+    exit 1
+}
+
+# ============================================================
+# FINAL VALIDATION
+# ============================================================
+
+samtools quickcheck "$BAM" || {
+    log "ERROR: Final BAM failed samtools quickcheck"
+    exit 1
+}
+
+# ============================================================
+# CLEANUP
+# ============================================================
+
 if [[ "${DEBUG:-0}" != "1" ]]; then
+
+    log "Removing temporary working directory"
+
     rm -rf "$WORKDIR"
+
+else
+
+    log "DEBUG=1 -> keeping WORKDIR:"
+    log "$WORKDIR"
+
 fi
 
-log "Finished $SAMPLE"
+log "Finished mapping for $SAMPLE"
+
 ;;
 
 # ============================================================
-# QUAST (ASSEMBLY QC — ARRAY-AWARE)
+# QUAST (ASSEMBLY QC — ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 quast)
 
@@ -945,39 +1279,84 @@ mkdir -p "$QUAST_DIR" "$LOG_DIR"
 
 log "Starting QUAST step"
 log "THREADS: $THREADS"
+log "ASM_DIR: $ASM_DIR"
+log "QUAST_DIR: $QUAST_DIR"
 
-# -------------------- COLLECT ASSEMBLIES (STRICT, SAME AS MAPPING) --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        SAMPLE=$(basename "$d")
-        ASM="$d/${SAMPLE}.contigs.fa"
-        [[ -s "$ASM" ]] && echo "$ASM"
-    done | sort
-)
+# ============================================================
+# TOOL CHECK
+# ============================================================
 
-N=${#ASM_FILES[@]}
-log "Total valid assemblies: $N"
-
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No valid assemblies found"
+command -v quast.py >/dev/null 2>&1 || {
+    log "ERROR: quast.py not found"
+    log "Make sure QUAST is loaded/activated in the SLURM job"
     exit 1
 }
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    ASM="$ASM_DIR/$SAMPLE/${SAMPLE}.contigs.fa"
+
+    [[ -s "$ASM" ]] || {
+        log "ERROR: Assembly not found:"
+        log "$ASM"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.fa" \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total valid assemblies detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No valid assemblies found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.fa)
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "Skipping: Task ID ${SLURM_ARRAY_TASK_ID} > $N"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$ASM" | sed 's/.contigs.fa//')
+# ============================================================
+# OUTPUT
+# ============================================================
 
 OUTDIR="$QUAST_DIR/$SAMPLE"
 
@@ -986,22 +1365,44 @@ log "Processing sample: $SAMPLE"
 log "Assembly: $ASM"
 log "Output: $OUTDIR"
 
-# -------------------- INPUT CHECK --------------------
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
+
+# ============================================================
+# INPUT CHECK
+# ============================================================
+
 [[ -s "$ASM" ]] || {
-    log "ERROR: Missing assembly"
+    log "ERROR: Missing or empty assembly:"
+    log "$ASM"
     exit 1
 }
 
-# -------------------- SKIP --------------------
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
 if [[ -s "$OUTDIR/report.txt" && "${FORCE:-0}" != "1" ]]; then
-    log "QUAST exists → skipping"
+    log "QUAST already completed -> skipping"
+    log "$OUTDIR/report.txt"
     exit 0
 fi
 
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
+# ============================================================
+# CLEAN OLD / PARTIAL RUN
+# ============================================================
 
-# -------------------- RUN QUAST --------------------
+if [[ -d "$OUTDIR" ]]; then
+    log "Removing previous QUAST directory:"
+    log "$OUTDIR"
+    rm -rf "$OUTDIR"
+fi
+
+# ============================================================
+# RUN QUAST
+# ============================================================
+
 log "Running QUAST"
 
 quast.py \
@@ -1011,13 +1412,23 @@ quast.py \
     --min-contig 1000 \
     &>> "$LOG_DIR/${SAMPLE}.log"
 
-# -------------------- VALIDATE --------------------
+# ============================================================
+# VALIDATE
+# ============================================================
+
 if [[ ! -s "$OUTDIR/report.txt" ]]; then
     log "ERROR: QUAST failed for $SAMPLE"
+    log "Check log:"
+    log "$LOG_DIR/${SAMPLE}.log"
     exit 1
 fi
 
-log "Finished QUAST: $OUTDIR/report.txt"
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log "QUAST completed for $SAMPLE"
+log "Report: $OUTDIR/report.txt"
 
 ;;
 
@@ -1029,192 +1440,313 @@ quast_summary)
 set -euo pipefail
 shopt -s nullglob
 
-log() { echo "[$(date '+%F %T')] $*"; }
-
 QUAST_DIR="$OUTPUT_DIR/quast"
 META="/staging/leuven/stg_00100/Rodgee/caves_data/metadata/biological_metadata.tsv"
-OUT="$OUTPUT_DIR/quast/quast_summary.tsv"
+OUT="$QUAST_DIR/quast_summary.tsv"
 
-mkdir -p "$(dirname "$OUT")"
+mkdir -p "$QUAST_DIR"
 
 log "Creating QUAST summary table"
 
-# -------------------- HEADER --------------------
-echo -e "sample\tsample_code\tincubation\tn_contigs\ttotal_length\tN50\tGC" > "$OUT"
+# ============================================================
+# INPUT CHECKS
+# ============================================================
 
-# -------------------- LOOP --------------------
-for REPORT in "$QUAST_DIR"/*/report.txt; do
+[[ -d "$QUAST_DIR" ]] || {
+    log "ERROR: QUAST directory not found:"
+    log "$QUAST_DIR"
+    exit 1
+}
 
-    [[ -s "$REPORT" ]] || continue
+[[ -s "$META" ]] || {
+    log "ERROR: Metadata file not found or empty:"
+    log "$META"
+    exit 1
+}
+
+# ============================================================
+# HEADER
+# ============================================================
+
+printf "sample\tsample_code\tincubation\tn_contigs\ttotal_length\tN50\tGC\n" > "$OUT"
+
+# ============================================================
+# FIND REPORTS
+# ============================================================
+
+mapfile -t REPORTS < <(
+    find "$QUAST_DIR" \
+        -mindepth 2 \
+        -maxdepth 2 \
+        -type f \
+        -name "report.txt" \
+        | sort
+)
+
+NREPORTS=${#REPORTS[@]}
+
+log "QUAST reports detected: $NREPORTS"
+
+if (( NREPORTS == 0 )); then
+    log "ERROR: No QUAST report.txt files found"
+    exit 1
+fi
+
+# ============================================================
+# LOOP THROUGH SAMPLES
+# ============================================================
+
+NWRITTEN=0
+
+for REPORT in "${REPORTS[@]}"; do
 
     SAMPLE=$(basename "$(dirname "$REPORT")")
 
-    # -------------------- EXTRACT METADATA --------------------
-    read INC CODE < <(
-        awk -v s="$SAMPLE" '
-        BEGIN {FS="\t"}
-        $1==s {print $2, $3}
-        ' "$META"
-    )
+    log "Processing: $SAMPLE"
 
-    # -------------------- EXTRACT QUAST METRICS --------------------
-    ncontigs=$(grep -P "^# contigs \(>= 0 bp\)" "$REPORT" | awk '{print $NF}')
-    totlen=$(grep -P "^Total length \(>= 0 bp\)" "$REPORT" | awk '{print $NF}')
-    n50=$(grep -P "^N50" "$REPORT" | awk '{print $NF}')
-    gc=$(grep -P "^GC \(%\)" "$REPORT" | awk '{print $NF}')
+    # --------------------------------------------------------
+    # METADATA
+    # --------------------------------------------------------
 
-    echo -e "${SAMPLE}\t${CODE}\t${INC}\t${ncontigs}\t${totlen}\t${n50}\t${gc}" >> "$OUT"
+    INC="NA"
+    CODE="NA"
+
+    META_LINE=$(awk -F'\t' -v s="$SAMPLE" '
+        $1 == s {
+            print $2 "\t" $3
+            exit
+        }
+    ' "$META")
+
+    if [[ -n "$META_LINE" ]]; then
+        IFS=$'\t' read -r INC CODE <<< "$META_LINE"
+    else
+        log "WARNING: No metadata found for $SAMPLE"
+    fi
+
+    # --------------------------------------------------------
+    # QUAST METRICS
+    # --------------------------------------------------------
+
+    ncontigs=$(awk '
+        /^# contigs \(>= 0 bp\)/ {
+            print $NF
+            exit
+        }
+    ' "$REPORT")
+
+    totlen=$(awk '
+        /^Total length \(>= 0 bp\)/ {
+            print $NF
+            exit
+        }
+    ' "$REPORT")
+
+    n50=$(awk '
+        /^N50[[:space:]]/ {
+            print $NF
+            exit
+        }
+    ' "$REPORT")
+
+    gc=$(awk '
+        /^GC \(%\)/ {
+            print $NF
+            exit
+        }
+    ' "$REPORT")
+
+    # --------------------------------------------------------
+    # DEFAULT TO NA IF METRIC IS ABSENT
+    # --------------------------------------------------------
+
+    ncontigs="${ncontigs:-NA}"
+    totlen="${totlen:-NA}"
+    n50="${n50:-NA}"
+    gc="${gc:-NA}"
+
+    # --------------------------------------------------------
+    # WRITE OUTPUT
+    # --------------------------------------------------------
+
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$SAMPLE" \
+        "$CODE" \
+        "$INC" \
+        "$ncontigs" \
+        "$totlen" \
+        "$n50" \
+        "$gc" \
+        >> "$OUT"
+
+    ((NWRITTEN+=1))
 
 done
 
-log "Created: $OUT"
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log "Created QUAST summary:"
+log "$OUT"
+
+log "Samples written: $NWRITTEN"
 
 ;;
 
 # ============================================================
-# QUAST COMPARISON (SHORT vs LONG — FIXED)
-# ============================================================
-quast_compare_incubation)
-
-set -euo pipefail
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-IN="$OUTPUT_DIR/quast/quast_summary.tsv"
-OUT="$OUTPUT_DIR/quast/quast_comparison.tsv"
-
-log "Creating QUAST paired comparison"
-
-awk '
-BEGIN {
-    FS="\t"; OFS="\t"
-}
-
-NR==1 { next }
-
-{
-    # FIX: normalize sample_code (remove -L / -S)
-    base = $2
-    sub(/-[LS]$/, "", base)
-
-    if ($3 == "long") {
-        long[base] = $0
-    } else if ($3 == "short") {
-        short[base] = $0
-    }
-}
-
-END {
-    print "sample_code",
-          "long_sample","short_sample",
-          "long_contigs","short_contigs",
-          "long_length","short_length",
-          "long_N50","short_N50",
-          "long_GC","short_GC",
-          "delta_N50","delta_length"
-
-    for (k in long) {
-        if (k in short) {
-
-            split(long[k], L, "\t")
-            split(short[k], S, "\t")
-
-            print k,
-                  L[1], S[1],
-                  L[4], S[4],
-                  L[5], S[5],
-                  L[6], S[6],
-                  L[7], S[7],
-                  (L[6] - S[6]),
-                  (L[5] - S[5])
-        }
-    }
-}
-' "$IN" > "$OUT"
-
-log "Created: $OUT"
-
-;;
-
-# ============================================================
-# PER-SAMPLE COVERAGE (COVERM — ARRAY-AWARE)
+# PER-SAMPLE COVERAGE (COVERM — ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 coverage_coverm)
 
 set -euo pipefail
 shopt -s nullglob
 
-log() { echo "[$(date '+%F %T')] $*"; }
-
 THREADS="${THREADS:-8}"
 
 ASM_DIR="$OUTPUT_DIR/assembly"
 MAP_DIR="$OUTPUT_DIR/mapping"
-COV_DIR="$OUTPUT_DIR/coverage"
-LOG_DIR="$OUTPUT_DIR/logs/coverage"
+COV_DIR="$OUTPUT_DIR/coverage_coverm"
+LOG_DIR="$OUTPUT_DIR/logs/coverage_coverm"
 
 mkdir -p "$COV_DIR" "$LOG_DIR"
 
-log "Starting CoverM step"
+log "Starting CoverM coverage step"
 log "THREADS: $THREADS"
+log "ASM_DIR: $ASM_DIR"
+log "MAP_DIR: $MAP_DIR"
+log "COV_DIR: $COV_DIR"
 
-# -------------------- TOOL CHECK --------------------
-command -v coverm >/dev/null || {
-    log "ERROR: coverm not found (activate conda env)"
+# ============================================================
+# TOOL CHECK
+# ============================================================
+
+command -v coverm >/dev/null 2>&1 || {
+    log "ERROR: coverm not found"
+    log "Make sure the CoverM environment is activated in SLURM"
     exit 1
 }
 
-# -------------------- COLLECT ASSEMBLIES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        SAMPLE=$(basename "$d")
-        ASM="$d/${SAMPLE}.contigs.fa"
-        [[ -s "$ASM" ]] && echo "$ASM"
-    done | sort
-)
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
 
-N=${#ASM_FILES[@]}
-log "Total samples: $N"
+if [[ -n "${SAMPLE:-}" ]]; then
 
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No assemblies found"
-    exit 1
-}
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
+    ASM="$ASM_DIR/$SAMPLE/${SAMPLE}.contigs.fa"
+
+    [[ -s "$ASM" ]] || {
+        log "ERROR: Assembly not found:"
+        log "$ASM"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.fa" \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total assemblies detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No valid assemblies found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.fa)
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$ASM" | sed 's/.contigs.fa//')
+# ============================================================
+# SAMPLE FILES
+# ============================================================
 
 BAM="$MAP_DIR/${SAMPLE}.bam"
+
 RAW="$COV_DIR/${SAMPLE}.coverage.raw.tsv"
 OUT="$COV_DIR/${SAMPLE}.coverage.tsv"
+
 LOGFILE="$LOG_DIR/${SAMPLE}.log"
 
 log "----------------------------------------"
 log "Processing sample: $SAMPLE"
+log "Assembly: $ASM"
+log "BAM: $BAM"
+log "Raw coverage: $RAW"
+log "Final coverage: $OUT"
 
-# -------------------- INPUT CHECK --------------------
-[[ -s "$ASM" ]] || { log "ERROR: Missing assembly"; exit 1; }
-[[ -s "$BAM" ]] || { log "ERROR: Missing BAM"; exit 1; }
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
 
 # ============================================================
-# STEP 1: RUN COVERM (ONLY IF RAW MISSING)
+# INPUT CHECK
 # ============================================================
+
+[[ -s "$ASM" ]] || {
+    log "ERROR: Missing assembly:"
+    log "$ASM"
+    exit 1
+}
+
+[[ -s "$BAM" ]] || {
+    log "ERROR: Missing BAM:"
+    log "$BAM"
+    exit 1
+}
+
+# Check BAM integrity before using it
+samtools quickcheck "$BAM" 2>/dev/null || {
+    log "ERROR: BAM failed integrity check:"
+    log "$BAM"
+    exit 1
+}
+
+# ============================================================
+# STEP 1: RUN COVERM
+# ============================================================
+
 if [[ -s "$RAW" && "${FORCE:-0}" != "1" ]]; then
-    log "Raw coverage exists → skipping CoverM"
+
+    log "Raw coverage already exists -> skipping CoverM"
+
 else
+
+    # Remove partial/old raw result
+    rm -f "$RAW"
+
     log "Running CoverM"
 
     coverm contig \
@@ -1227,29 +1759,44 @@ else
         > "$RAW" \
         2> "$LOGFILE"
 
+    # -------------------- VALIDATE RAW --------------------
     [[ -s "$RAW" ]] || {
-        log "ERROR: CoverM failed or empty output"
+        log "ERROR: CoverM failed or produced empty output"
+        log "Check log:"
+        log "$LOGFILE"
         exit 1
     }
+
 fi
 
 # ============================================================
-# STEP 2: COMPUTE WEIGHTED COVERAGE (ROBUST PARSING)
+# STEP 2: COMPUTE WEIGHTED COVERAGE
 # ============================================================
+
 if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
-    log "Final coverage exists → skipping weighting"
+
+    log "Final coverage already exists -> skipping weighting"
     exit 0
+
 fi
+
+# Remove partial previous output
+rm -f "$OUT"
 
 log "Computing coverage_weighted"
 
-# Debug header (important)
-log "Header:"
+# Save CoverM header to log for debugging
+log "CoverM header:"
 head -n 1 "$RAW" | tee -a "$LOGFILE"
 
-# -------------------- ROBUST PARSER --------------------
+# ============================================================
+# ROBUST COVERM OUTPUT PARSER
+# ============================================================
+
 awk '
-BEGIN {OFS="\t"}
+BEGIN {
+    OFS="\t"
+}
 
 NR==1 {
     print "contig", "mean_coverage", "covered_fraction", "length", "coverage_weighted"
@@ -1257,36 +1804,57 @@ NR==1 {
 }
 
 {
-    contig = $1
+    contig=$1
 
-    # collect ONLY numeric fields
-    n = 0
+    # Reset numeric-field counter for every row
+    n=0
+
+    # Collect numeric fields from CoverM output
     for (i=1; i<=NF; i++) {
-        if ($i ~ /^[0-9.]+$/) {
-            nums[++n] = $i
+
+        if ($i ~ /^[-+]?[0-9]*\.?[0-9]+([eE][-+]?[0-9]+)?$/) {
+            nums[++n]=$i
         }
     }
 
-    if (n < 3) next
+    # Expected final numeric fields:
+    # mean, covered_fraction, length
+    if (n < 3)
+        next
 
-    cov  = nums[n-2]
-    frac = nums[n-1]
-    len  = nums[n]
+    cov=nums[n-2]
+    frac=nums[n-1]
+    len=nums[n]
 
-    print contig, cov, frac, len, cov * len
+    weighted=cov*len
+
+    print contig, cov, frac, len, weighted
 }
 ' "$RAW" > "$OUT"
 
-# -------------------- VALIDATE --------------------
+# ============================================================
+# VALIDATE FINAL OUTPUT
+# ============================================================
+
 [[ -s "$OUT" ]] || {
-    log "ERROR: Output not created"
+    log "ERROR: Final coverage output not created"
     exit 1
 }
 
-# -------------------- SUMMARY --------------------
-log "Preview:"
+NLINES=$(wc -l < "$OUT")
+
+if (( NLINES <= 1 )); then
+    log "WARNING: Coverage output contains header only"
+fi
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log "Coverage preview:"
 head -n 5 "$OUT" | tee -a "$LOGFILE"
 
+log "Number of output lines: $NLINES"
 log "Finished coverage for $SAMPLE"
 
 ;;
@@ -1301,8 +1869,8 @@ shopt -s nullglob
 
 log() { echo "[$(date '+%F %T')] $*"; }
 
-COV_DIR="$OUTPUT_DIR/coverage"
-OUT="$OUTPUT_DIR/coverage/coverage_per_sample.tsv"
+COV_DIR="$OUTPUT_DIR/coverage_coverm"
+OUT="$OUTPUT_DIR/coverage_coverm/coverage_per_sample.tsv"
 
 log "Summarizing coverage per sample (weighted)"
 
@@ -1334,169 +1902,12 @@ log "Created: $OUT"
 ;;
 
 # ============================================================
-# PER-SAMPLE COVERAGE (COVERM — ARRAY-AWARE)
-# ============================================================
-coverage_coverm)
-
-set -euo pipefail
-shopt -s nullglob
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-THREADS="${THREADS:-8}"
-
-ASM_DIR="$OUTPUT_DIR/assembly"
-MAP_DIR="$OUTPUT_DIR/mapping"
-COV_DIR="$OUTPUT_DIR/coverage"
-LOG_DIR="$OUTPUT_DIR/logs/coverage"
-
-mkdir -p "$COV_DIR" "$LOG_DIR"
-
-log "Starting CoverM step"
-log "THREADS: $THREADS"
-
-# -------------------- TOOL CHECK --------------------
-command -v coverm >/dev/null || {
-    log "ERROR: coverm not found (activate conda env)"
-    exit 1
-}
-
-# -------------------- COLLECT ASSEMBLIES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        SAMPLE=$(basename "$d")
-        ASM="$d/${SAMPLE}.contigs.fa"
-        [[ -s "$ASM" ]] && echo "$ASM"
-    done | sort
-)
-
-N=${#ASM_FILES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No assemblies found"
-    exit 1
-}
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$ASM" | sed 's/.contigs.fa//')
-
-BAM="$MAP_DIR/${SAMPLE}.bam"
-RAW="$COV_DIR/${SAMPLE}.coverage.raw.tsv"
-OUT="$COV_DIR/${SAMPLE}.coverage.tsv"
-LOGFILE="$LOG_DIR/${SAMPLE}.log"
-
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
-
-# -------------------- INPUT CHECK --------------------
-[[ -s "$ASM" ]] || { log "ERROR: Missing assembly"; exit 1; }
-[[ -s "$BAM" ]] || { log "ERROR: Missing BAM"; exit 1; }
-
-# ============================================================
-# STEP 1: RUN COVERM (ONLY IF RAW MISSING)
-# ============================================================
-if [[ -s "$RAW" && "${FORCE:-0}" != "1" ]]; then
-    log "Raw coverage exists → skipping CoverM"
-else
-    log "Running CoverM"
-
-    coverm contig \
-        --bam-files "$BAM" \
-        --threads "$THREADS" \
-        --methods mean covered_fraction length \
-        --min-read-percent-identity 0.95 \
-        --min-read-aligned-percent 75 \
-        --output-format dense \
-        > "$RAW" \
-        2> "$LOGFILE"
-
-    [[ -s "$RAW" ]] || {
-        log "ERROR: CoverM failed or empty output"
-        exit 1
-    }
-fi
-
-# ============================================================
-# STEP 2: COMPUTE WEIGHTED COVERAGE (ROBUST PARSING)
-# ============================================================
-if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
-    log "Final coverage exists → skipping weighting"
-    exit 0
-fi
-
-log "Computing coverage_weighted"
-
-# Debug header (important)
-log "Header:"
-head -n 1 "$RAW" | tee -a "$LOGFILE"
-
-# -------------------- ROBUST PARSER --------------------
-awk '
-BEGIN {OFS="\t"}
-
-NR==1 {
-    print "contig", "mean_coverage", "covered_fraction", "length", "coverage_weighted"
-    next
-}
-
-{
-    contig = $1
-
-    # collect ONLY numeric fields
-    n = 0
-    for (i=1; i<=NF; i++) {
-        if ($i ~ /^[0-9.]+$/) {
-            nums[++n] = $i
-        }
-    }
-
-    if (n < 3) next
-
-    cov  = nums[n-2]
-    frac = nums[n-1]
-    len  = nums[n]
-
-    print contig, cov, frac, len, cov * len
-}
-' "$RAW" > "$OUT"
-
-# -------------------- VALIDATE --------------------
-[[ -s "$OUT" ]] || {
-    log "ERROR: Output not created"
-    exit 1
-}
-
-# -------------------- SUMMARY --------------------
-log "Preview:"
-head -n 5 "$OUT" | tee -a "$LOGFILE"
-
-log "Finished coverage for $SAMPLE"
-
-;;
-
-# ============================================================
-# PER-SAMPLE COVERAGE (SAMTOOLS -AA — ARRAY-AWARE)
+# PER-SAMPLE COVERAGE (SAMTOOLS -aa — ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 coverage_samtools)
 
 set -euo pipefail
 shopt -s nullglob
-
-log() { echo "[$(date '+%F %T')] $*"; }
 
 THREADS="${THREADS:-8}"
 
@@ -1507,91 +1918,196 @@ LOG_DIR="$OUTPUT_DIR/logs/coverage_samtools"
 mkdir -p "$COV_DIR" "$LOG_DIR"
 
 log "Starting samtools coverage step"
+log "THREADS: $THREADS"
+log "MAP_DIR: $MAP_DIR"
+log "COV_DIR: $COV_DIR"
 
-# -------------------- COLLECT BAM FILES --------------------
-mapfile -t BAM_FILES < <(
-    for f in "$MAP_DIR"/*.bam; do
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
+# ============================================================
+# TOOL CHECK
+# ============================================================
 
-N=${#BAM_FILES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No BAM files found"
+command -v samtools >/dev/null 2>&1 || {
+    log "ERROR: samtools not found"
     exit 1
 }
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    BAM="$MAP_DIR/${SAMPLE}.bam"
+
+    [[ -s "$BAM" ]] || {
+        log "ERROR: BAM not found:"
+        log "$BAM"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t BAM_FILES < <(
+        find "$MAP_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.bam" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#BAM_FILES[@]}
+
+    log "Total BAM files detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No BAM files found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    BAM="${BAM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$BAM" .bam)
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-BAM="${BAM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$BAM" .bam)
+# ============================================================
+# SAMPLE FILES
+# ============================================================
 
 OUT="$COV_DIR/${SAMPLE}.samtools.tsv"
 LOGFILE="$LOG_DIR/${SAMPLE}.log"
 
 log "----------------------------------------"
 log "Processing sample: $SAMPLE"
+log "BAM: $BAM"
+log "Output: $OUT"
 
-# -------------------- INPUT CHECK --------------------
-[[ -s "$BAM" ]] || { log "ERROR: Missing BAM"; exit 1; }
-
-# ============================================================
-# STEP: SAMTOOLS DEPTH
-# ============================================================
-if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
-    log "Output exists → skipping"
-    exit 0
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
 fi
 
-log "Running samtools depth (-aa)"
+# ============================================================
+# INPUT CHECK
+# ============================================================
 
-samtools depth -aa "$BAM" | \
-awk -v sample="$SAMPLE" '
-BEGIN {
-    sum = 0;
-    total = 0;
-    covered = 0;
-}
-{
-    depth = $3;
-
-    total++;
-
-    if (depth > 0) {
-        covered++;
-        sum += depth;
-    }
-}
-END {
-    mean = (total > 0) ? sum / total : 0;
-    breadth = (total > 0) ? covered / total : 0;
-
-    print "sample\tmean_coverage\tbreadth";
-    printf "%s\t%.6f\t%.6f\n", sample, mean, breadth;
-}
-' > "$OUT" 2>> "$LOGFILE"
-
-# -------------------- VALIDATE --------------------
-[[ -s "$OUT" ]] || {
-    log "ERROR: samtools output not created"
+[[ -s "$BAM" ]] || {
+    log "ERROR: Missing or empty BAM:"
+    log "$BAM"
     exit 1
 }
 
-# -------------------- PREVIEW --------------------
-log "Preview:"
-head -n 5 "$OUT" | tee -a "$LOGFILE"
+# Check BAM integrity
+samtools quickcheck "$BAM" || {
+    log "ERROR: BAM failed samtools quickcheck:"
+    log "$BAM"
+    exit 1
+}
+
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
+if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
+    log "Samtools coverage already completed -> skipping"
+    log "$OUT"
+    exit 0
+fi
+
+# ============================================================
+# CLEAN PARTIAL OUTPUT
+# ============================================================
+
+rm -f "$OUT"
+
+# ============================================================
+# RUN SAMTOOLS DEPTH
+# ============================================================
+
+log "Running samtools depth (-aa)"
+
+samtools depth \
+    -aa \
+    "$BAM" \
+    2>> "$LOGFILE" \
+| awk -v sample="$SAMPLE" '
+BEGIN {
+    sum = 0
+    total = 0
+    covered = 0
+}
+
+{
+    depth = $3
+
+    total++
+    sum += depth
+
+    if (depth > 0) {
+        covered++
+    }
+}
+
+END {
+
+    if (total > 0) {
+        mean = sum / total
+        breadth = covered / total
+    }
+    else {
+        mean = 0
+        breadth = 0
+    }
+
+    print "sample\tmean_coverage\tbreadth"
+    printf "%s\t%.6f\t%.6f\n", sample, mean, breadth
+}
+' > "$OUT"
+
+# ============================================================
+# VALIDATE
+# ============================================================
+
+[[ -s "$OUT" ]] || {
+    log "ERROR: samtools coverage output not created"
+    exit 1
+}
+
+NLINES=$(wc -l < "$OUT")
+
+if (( NLINES < 2 )); then
+    log "ERROR: Coverage output does not contain a data row"
+    exit 1
+fi
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log "Coverage result:"
+cat "$OUT" | tee -a "$LOGFILE"
 
 log "Finished samtools coverage for $SAMPLE"
 
@@ -1623,7 +2139,7 @@ log "Created: $OUT"
 ;;
 
 # ============================================================
-### COVERAGE (JGI DEPTH — PER-SAMPLE, ARRAY-AWARE)
+### COVERAGE (JGI DEPTH — ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 coverage_metabat)
 
@@ -1640,60 +2156,180 @@ LOG_DIR="$OUTPUT_DIR/logs/coverage_metabat"
 
 mkdir -p "$COV_DIR" "$LOG_DIR"
 
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t BAM_FILES < <(
-    for f in "$MAP_DIR"/*.bam; do
-        [[ -f "$f" ]] && echo "$f"
-    done | sort
-)
+log "THREADS: $THREADS"
+log "MAP_DIR: $MAP_DIR"
+log "COV_DIR: $COV_DIR"
 
-N=${#BAM_FILES[@]}
-log "Total BAM files: $N"
+# ============================================================
+# TOOL CHECK
+# ============================================================
 
-[[ "$N" -gt 0 ]] || { log "ERROR: No BAM files found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
+command -v jgi_summarize_bam_contig_depths >/dev/null 2>&1 || {
+    log "ERROR: jgi_summarize_bam_contig_depths not found"
+    log "Make sure MetaBAT2 is loaded/activated in the SLURM job"
     exit 1
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    BAM="$MAP_DIR/${SAMPLE}.bam"
+
+    [[ -s "$BAM" ]] || {
+        log "ERROR: BAM not found:"
+        log "$BAM"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t BAM_FILES < <(
+        find "$MAP_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.bam" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#BAM_FILES[@]}
+
+    log "Total BAM files detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No BAM files found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    BAM="${BAM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$BAM" .bam)
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample for this index → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-BAM="${BAM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$BAM" .bam)
+# ============================================================
+# SAMPLE FILES
+# ============================================================
 
 DEPTH="$COV_DIR/${SAMPLE}.depth.txt"
+LOGFILE="$LOG_DIR/${SAMPLE}.log"
 
 log "----------------------------------------"
-log "Processing: $SAMPLE"
+log "Processing sample: $SAMPLE"
 log "BAM: $BAM"
+log "Depth output: $DEPTH"
 
-# -------------------- SKIP --------------------
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
+
+# ============================================================
+# INPUT CHECK
+# ============================================================
+
+[[ -s "$BAM" ]] || {
+    log "ERROR: Missing or empty BAM:"
+    log "$BAM"
+    exit 1
+}
+
+# ============================================================
+# OPTIONAL BAM INTEGRITY CHECK
+# ============================================================
+
+if command -v samtools >/dev/null 2>&1; then
+
+    samtools quickcheck "$BAM" || {
+        log "ERROR: BAM failed samtools quickcheck:"
+        log "$BAM"
+        exit 1
+    }
+
+else
+
+    log "WARNING: samtools not available -> skipping BAM integrity check"
+
+fi
+
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
 if [[ -s "$DEPTH" && "${FORCE:-0}" != "1" ]]; then
-    log "Depth already exists → skipping"
+    log "Depth already completed -> skipping"
+    log "$DEPTH"
     exit 0
 fi
 
-# -------------------- RUN JGI DEPTH --------------------
+# ============================================================
+# CLEAN PARTIAL OUTPUT
+# ============================================================
+
+rm -f "$DEPTH"
+
+# ============================================================
+# RUN JGI DEPTH
+# ============================================================
+
 log "Running jgi_summarize_bam_contig_depths"
 
 jgi_summarize_bam_contig_depths \
     --outputDepth "$DEPTH" \
     "$BAM" \
-    &>> "$LOG_DIR/${SAMPLE}.log"
+    &>> "$LOGFILE"
 
-# -------------------- VALIDATE --------------------
+# ============================================================
+# VALIDATE
+# ============================================================
+
 [[ -s "$DEPTH" ]] || {
     log "ERROR: Depth calculation failed"
+    log "Check log:"
+    log "$LOGFILE"
     exit 1
 }
 
-log "Finished depth for $SAMPLE"
+NLINES=$(wc -l < "$DEPTH")
+
+if (( NLINES <= 1 )); then
+    log "WARNING: Depth file contains header only"
+fi
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
+log "Depth preview:"
+head -n 5 "$DEPTH" | tee -a "$LOGFILE"
+
+log "Number of lines: $NLINES"
+log "Finished JGI depth calculation for $SAMPLE"
+
 ;;
 
 
@@ -1982,6 +2618,7 @@ log "Header cleaning step completed"
 
 # ============================================================
 ### BINNING (METABAT2 — CLEAN ASSEMBLY, FILTERED DEPTH)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 binning_metabat_prok)
 
@@ -1990,10 +2627,15 @@ shopt -s nullglob
 
 log "Starting MetaBAT2 binning (clean assembly)"
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 THREADS="${THREADS:-8}"
 MIN_LEN="${MIN_LEN:-1500}"
 
 ASM_DIR="$OUTPUT_DIR/assembly_clean"
+
 COV_DIR="$OUTPUT_DIR/coverage_metabat"
 COV_FILT_DIR="$OUTPUT_DIR/coverage_metabat_filtered"
 
@@ -2002,400 +2644,682 @@ LOG_DIR="$OUTPUT_DIR/logs/binning_metabat_prok"
 
 mkdir -p "$BIN_DIR" "$LOG_DIR"
 
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        s=$(basename "$d")
-        f="$d/${s}.contigs.clean.fa"
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
-
-N=${#ASM_FILES[@]}
-log "Total assemblies: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No cleaned assemblies found"; exit 1; }
+log "THREADS: $THREADS"
+log "MIN_LEN: $MIN_LEN"
+log "ASM_DIR: $ASM_DIR"
+log "COV_DIR: $COV_DIR"
+log "COV_FILT_DIR: $COV_FILT_DIR"
+log "BIN_DIR: $BIN_DIR"
 
 # ============================================================
-# SINGLE-SAMPLE OVERRIDE
+# INPUT DIRECTORY CHECK
 # ============================================================
-if [[ -n "${TARGET_SAMPLE:-}" ]]; then
 
-    log "TARGET_SAMPLE detected: $TARGET_SAMPLE"
+[[ -d "$ASM_DIR" ]] || {
+    log "ERROR: Clean assembly directory not found:"
+    log "$ASM_DIR"
+    exit 1
+}
 
-    FOUND=0
+# ============================================================
+# TOOL CHECKS
+# ============================================================
 
-    for f in "${ASM_FILES[@]}"; do
+command -v metabat2 >/dev/null 2>&1 || {
+    log "ERROR: metabat2 not found"
+    exit 1
+}
 
-        s=$(basename "$f" .contigs.clean.fa)
+command -v seqkit >/dev/null 2>&1 || {
+    log "ERROR: seqkit not found"
+    exit 1
+}
 
-        if [[ "$s" == "$TARGET_SAMPLE" ]]; then
-            ASM_FILES=("$f")
-            FOUND=1
-            break
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
+
+run_metabat() {
+
+    local SAMPLE="$1"
+
+    local CONTIGS="$ASM_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
+
+    local DEPTH_FILT="$COV_FILT_DIR/${SAMPLE}.depth.txt"
+    local DEPTH_RAW="$COV_DIR/${SAMPLE}.depth.txt"
+
+    local DEPTH=""
+
+    local OUTDIR="$BIN_DIR/$SAMPLE"
+
+    local FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
+
+    local DEPTH_LIST="$OUTDIR/depth.list"
+    local CONTIG_LIST="$OUTDIR/contigs.list"
+    local SHARED_LIST="$OUTDIR/shared.list"
+
+    local MATCHED_CONTIGS="$OUTDIR/${SAMPLE}.metabat.input.fa"
+    local MATCHED_DEPTH="$OUTDIR/${SAMPLE}.metabat.depth.txt"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local N_SHARED=0
+    local N_BINS=0
+    local EXIT_CODE=0
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Clean assembly: $CONTIGS"
+    log "Output directory: $OUTDIR"
+
+    # ========================================================
+    # INPUT CHECK: CONTIGS
+    # ========================================================
+
+    if [[ ! -e "$CONTIGS" ]]; then
+        log "ERROR: Clean assembly does not exist:"
+        log "$CONTIGS"
+        return 1
+    fi
+
+    if [[ ! -s "$CONTIGS" ]]; then
+        log "No clean contigs for $SAMPLE -> MetaBAT2 not required"
+        return 0
+    fi
+
+    # ========================================================
+    # SELECT DEPTH FILE
+    # ========================================================
+
+    if [[ -s "$DEPTH_FILT" ]]; then
+
+        DEPTH="$DEPTH_FILT"
+
+        log "Using FILTERED depth:"
+        log "$DEPTH"
+
+    elif [[ -s "$DEPTH_RAW" ]]; then
+
+        DEPTH="$DEPTH_RAW"
+
+        log "WARNING: Filtered depth not found"
+        log "Using UNFILTERED depth:"
+        log "$DEPTH"
+
+    else
+
+        log "ERROR: No depth file found for $SAMPLE"
+        log "Checked:"
+        log "$DEPTH_FILT"
+        log "$DEPTH_RAW"
+
+        return 1
+    fi
+
+    # ========================================================
+    # SKIP IF COMPLETED
+    # ========================================================
+
+    if [[ "${FORCE:-0}" != "1" ]]; then
+
+        if [[ -f "$OUTDIR/METABAT_COMPLETE" ]]; then
+            log "MetaBAT2 already completed -> skipping"
+            return 0
         fi
-    done
 
-    if [[ "$FOUND" -eq 0 ]]; then
-        log "ERROR: TARGET_SAMPLE not found in assemblies"
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "MetaBAT2 previously completed with no bins -> skipping"
+            return 0
+        fi
+
+        if [[ -d "$OUTDIR" ]] &&
+           compgen -G "$OUTDIR/bin*.fa" >/dev/null; then
+
+            log "MetaBAT2 bins already exist -> skipping"
+            return 0
+        fi
+
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete MetaBAT2 directory:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # FILTER CONTIGS BY LENGTH
+    # ========================================================
+
+    log "Filtering contigs"
+    log "Minimum contig length: ${MIN_LEN} bp"
+
+    seqkit seq \
+        -m "$MIN_LEN" \
+        "$CONTIGS" \
+        > "$FILTERED_CONTIGS"
+
+    if [[ ! -s "$FILTERED_CONTIGS" ]]; then
+
+        log "No contigs >= ${MIN_LEN} bp"
+        log "Nothing to bin for $SAMPLE"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CONTIG / DEPTH CONSISTENCY CHECK
+    # ========================================================
+
+    log "Checking contig-depth consistency"
+
+    # Depth contig IDs
+    awk -F'\t' '
+        NR > 1 && NF > 0 {
+            print $1
+        }
+    ' "$DEPTH" \
+        | sort -u \
+        > "$DEPTH_LIST"
+
+    # FASTA contig IDs
+    awk '
+        /^>/ {
+            sub(/^>/,"")
+            split($0,a,/[\t ]/)
+            print a[1]
+        }
+    ' "$FILTERED_CONTIGS" \
+        | sort -u \
+        > "$CONTIG_LIST"
+
+    # Shared contigs
+    comm -12 \
+        "$DEPTH_LIST" \
+        "$CONTIG_LIST" \
+        > "$SHARED_LIST"
+
+    N_SHARED=$(wc -l < "$SHARED_LIST")
+
+    log "Matching contigs between FASTA and depth: $N_SHARED"
+
+    if (( N_SHARED == 0 )); then
+
+        log "ERROR: No overlap between assembly contigs and depth file"
+        log "MetaBAT2 cannot proceed"
+
+        return 1
+
+    elif (( N_SHARED < 100 )); then
+
+        log "WARNING: Low contig-depth overlap ($N_SHARED)"
+
+    fi
+
+    # ========================================================
+    # CREATE MATCHED FASTA
+    # ========================================================
+
+    log "Creating MetaBAT2 FASTA containing only shared contigs"
+
+    seqkit grep \
+        -f "$SHARED_LIST" \
+        "$FILTERED_CONTIGS" \
+        > "$MATCHED_CONTIGS"
+
+    if [[ ! -s "$MATCHED_CONTIGS" ]]; then
+        log "ERROR: Matched FASTA is empty"
+        return 1
+    fi
+
+    # ========================================================
+    # CREATE MATCHED DEPTH FILE
+    # ========================================================
+
+    log "Creating matching MetaBAT2 depth file"
+
+    awk -F'\t' '
+        BEGIN {
+            OFS="\t"
+        }
+
+        NR==FNR {
+            keep[$1]=1
+            next
+        }
+
+        FNR==1 {
+            print
+            next
+        }
+
+        ($1 in keep) {
+            print
+        }
+    ' "$SHARED_LIST" "$DEPTH" \
+        > "$MATCHED_DEPTH"
+
+    if [[ ! -s "$MATCHED_DEPTH" ]]; then
+        log "ERROR: Matched depth file is empty"
+        return 1
+    fi
+
+    # ========================================================
+    # RUN METABAT2
+    # ========================================================
+
+    log "Running MetaBAT2"
+    log "Input FASTA: $MATCHED_CONTIGS"
+    log "Input depth: $MATCHED_DEPTH"
+
+    set +e
+
+    metabat2 \
+        -i "$MATCHED_CONTIGS" \
+        -a "$MATCHED_DEPTH" \
+        -o "$OUTDIR/bin" \
+        -t "$THREADS" \
+        -m "$MIN_LEN" \
+        &>> "$LOGFILE"
+
+    EXIT_CODE=$?
+
+    set -e
+
+    log "MetaBAT2 exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: MetaBAT2 failed for $SAMPLE"
+        log "Last 50 lines of log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE / COUNT BINS
+    # ========================================================
+
+    N_BINS=$(find "$OUTDIR" \
+        -maxdepth 1 \
+        -type f \
+        -name "bin*.fa" \
+        | wc -l)
+
+    if (( N_BINS == 0 )); then
+
+        log "MetaBAT2 completed successfully but produced no bins"
+
+        touch "$OUTDIR/NO_BINS"
+
+    else
+
+        log "Bins produced: $N_BINS"
+
+        touch "$OUTDIR/METABAT_COMPLETE"
+
+    fi
+
+    log "Finished MetaBAT2 for $SAMPLE"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
+
+    run_metabat "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.clean.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total cleaned assemblies detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No cleaned assemblies found"
         exit 1
     fi
 
-    N=1
-    SLURM_ARRAY_TASK_ID=1
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+
+    CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$CONTIGS" .contigs.clean.fa)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_metabat "$SAMPLE"
+
 fi
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
+log "MetaBAT2 prokaryotic binning step completed"
 
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample for this index → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$CONTIGS" .contigs.clean.fa)
-
-DEPTH_FILT="$COV_FILT_DIR/${SAMPLE}.depth.txt"
-DEPTH_RAW="$COV_DIR/${SAMPLE}.depth.txt"
-
-OUTDIR="$BIN_DIR/$SAMPLE"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE"
-
-# -------------------- INPUT CHECK --------------------
-[[ -s "$CONTIGS" ]] || { log "No contigs → skip"; exit 0; }
-
-# Prefer filtered depth
-if [[ -s "$DEPTH_FILT" ]]; then
-    DEPTH="$DEPTH_FILT"
-    log "Using FILTERED depth"
-elif [[ -s "$DEPTH_RAW" ]]; then
-    DEPTH="$DEPTH_RAW"
-    log "WARNING: Using UNFILTERED depth"
-else
-    log "No depth file → skip"
-    exit 0
-fi
-
-log "CONTIGS: $CONTIGS"
-log "DEPTH:   $DEPTH"
-
-# HANDLE INCOMPLETE OUTPUT
-
-if [[ -d "$OUTDIR" ]] && ! compgen -G "$OUTDIR/bin*.fa" > /dev/null; then
-    log "Incomplete run detected → cleaning"
-    rm -rf "$OUTDIR"
-fi
-
-# -------------------- SKIP --------------------
-if [[ -d "$OUTDIR" ]] && compgen -G "$OUTDIR/bin*.fa" > /dev/null \
-   && [[ "${FORCE:-0}" != "1" ]]; then
-    log "Binning already exists → skipping"
-    exit 0
-fi
-
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR"
-
-# FILTER CONTIGS BY LENGTH
-
-FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
-
-log "Filtering contigs (min length = $MIN_LEN)"
-
-seqkit seq -m "$MIN_LEN" "$CONTIGS" > "$FILTERED_CONTIGS"
-
-[[ -s "$FILTERED_CONTIGS" ]] || {
-    log "ERROR: No contigs after filtering"
-    exit 1
-}
-
-# CONSISTENCY CHECK
-
-log "Checking contig–depth consistency"
-
-grep -v '^contigName' "$DEPTH" | cut -f1 | sort > "$OUTDIR/depth.list"
-grep "^>" "$FILTERED_CONTIGS" | sed 's/^>//' | sort > "$OUTDIR/contigs.list"
-
-comm -12 "$OUTDIR/depth.list" "$OUTDIR/contigs.list" > "$OUTDIR/shared.list"
-
-N_SHARED=$(wc -l < "$OUTDIR/shared.list")
-
-if [[ "$N_SHARED" -lt 100 ]]; then
-    log "WARNING: Low overlap between contigs and depth ($N_SHARED)"
-else
-    log "Matching contigs: $N_SHARED"
-fi
-
-# RUN METABAT2
-
-log "Running MetaBAT2"
-
-metabat2 \
-    -i "$FILTERED_CONTIGS" \
-    -a "$DEPTH" \
-    -o "$OUTDIR/bin" \
-    -t "$THREADS" \
-    -m "$MIN_LEN" \
-    &>> "$LOG_DIR/${SAMPLE}.log"
-
-# -------------------- VALIDATE --------------------
-N_BINS=$(ls "$OUTDIR"/bin*.fa 2>/dev/null | wc -l || true)
-
-if [[ "$N_BINS" -eq 0 ]]; then
-    log "WARNING: No bins produced"
-else
-    log "Bins produced: $N_BINS"
-fi
-
-log "Finished MetaBAT2 for $SAMPLE"
-;;
-
-# ============================================================
-### COVERM (CONTIG COVERAGE FOR MAXBIN— ARRAY-AWARE, FULL ASSEMBLY)
-# ============================================================
-coverm_prok)
-
-set -euo pipefail
-shopt -s nullglob
-
-log "Starting CoverM (full contig coverage)"
-
-THREADS="${THREADS:-8}"
-
-MAP_DIR="$OUTPUT_DIR/mapping"
-COV_DIR="$OUTPUT_DIR/coverage_coverm"
-LOG_DIR="$OUTPUT_DIR/logs/coverage_coverm"
-
-mkdir -p "$COV_DIR" "$LOG_DIR"
-
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t BAM_FILES < <(
-    for f in "$MAP_DIR"/*.bam; do
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
-
-N=${#BAM_FILES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No BAM files found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-BAM="${BAM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$BAM" .bam)
-
-OUT="$COV_DIR/${SAMPLE}.coverm.tsv"
-LOGFILE="$LOG_DIR/${SAMPLE}.log"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE"
-log "BAM: $BAM"
-
-# -------------------- INPUT CHECK --------------------
-[[ -s "$BAM" ]] || {
-    log "Missing BAM → skipping"
-    exit 0
-}
-
-# -------------------- SKIP --------------------
-if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
-    log "CoverM already done → skipping"
-    exit 0
-fi
-
-# -------------------- RUN COVERM --------------------
-log "Running CoverM"
-
-coverm contig \
-    --bam-files "$BAM" \
-    --methods mean covered_fraction length \
-    --threads "$THREADS" \
-    --output-file "$OUT" \
-    2> "$LOGFILE"
-
-# -------------------- VALIDATE --------------------
-[[ -s "$OUT" ]] || {
-    log "ERROR: CoverM failed for $SAMPLE"
-    exit 1
-}
-
-# -------------------- PREVIEW --------------------
-log "Preview:"
-head -n 5 "$OUT" | tee -a "$LOGFILE"
-
-log "Finished CoverM for $SAMPLE"
 ;;
 
 # ============================================================
 ### CLEAN COVERM (MAKE MAXBIN-COMPATIBLE)
+# Uses output from coverage_coverm
 # ============================================================
 clean_coverm)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting CoverM cleaning"
+log "Starting CoverM cleaning for MaxBin"
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 COV_DIR="$OUTPUT_DIR/coverage_coverm"
 ASM_CLEAN_DIR="$OUTPUT_DIR/assembly_clean"
+
 OUT_DIR="$OUTPUT_DIR/coverage_coverm_clean"
 LOG_DIR="$OUTPUT_DIR/logs/coverage_coverm_clean"
 
 mkdir -p "$OUT_DIR" "$LOG_DIR"
 
-# -------------------- COLLECT FILES --------------------
-mapfile -t COV_FILES < <(
-    for f in "$COV_DIR"/*.coverm.tsv; do
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
 
-N=${#COV_FILES[@]}
-log "Total samples: $N"
+# ============================================================
+# FUNCTION
+# ============================================================
 
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No CoverM files found"
-    exit 1
+run_clean_coverm() {
+
+    local SAMPLE="$1"
+
+    local COV="$COV_DIR/${SAMPLE}.coverage.tsv"
+
+    local CLEAN_CONTIGS="$ASM_CLEAN_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
+
+    local OUT="$OUT_DIR/${SAMPLE}.coverm.clean.tsv"
+
+    local CONTIG_LIST="$OUT_DIR/${SAMPLE}.contigs.list"
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Coverage: $COV"
+    log "Clean contigs: $CLEAN_CONTIGS"
+    log "Output: $OUT"
+
+    # ========================================================
+    # INPUT CHECKS
+    # ========================================================
+
+    [[ -s "$COV" ]] || {
+        log "ERROR: Coverage file missing:"
+        log "$COV"
+        return 1
+    }
+
+    [[ -s "$CLEAN_CONTIGS" ]] || {
+        log "ERROR: Cleaned assembly missing:"
+        log "$CLEAN_CONTIGS"
+        return 1
+    }
+
+    # ========================================================
+    # SKIP IF DONE
+    # ========================================================
+
+    if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
+
+        log "Clean CoverM already exists -> skipping"
+
+        return 0
+    fi
+
+    # ========================================================
+    # EXTRACT CLEAN CONTIG IDs
+    # ========================================================
+
+    awk '
+    /^>/ {
+        sub(/^>/,"")
+        split($0,a,/[\t ]/)
+        print a[1]
+    }
+    ' "$CLEAN_CONTIGS" \
+        | sort -u \
+        > "$CONTIG_LIST"
+
+    N_CONTIGS=$(wc -l < "$CONTIG_LIST")
+
+    log "Clean contigs detected: $N_CONTIGS"
+
+    if (( N_CONTIGS == 0 )); then
+        log "ERROR: No cleaned contigs detected"
+        return 1
+    fi
+
+    # ========================================================
+    # FILTER COVERAGE
+    #
+    # coverage_coverm output:
+    #
+    # $1 = contig
+    # $2 = mean_coverage
+    # $3 = covered_fraction
+    # $4 = length
+    # $5 = coverage_weighted
+    #
+    # MaxBin requires:
+    #
+    # contig_ID    abundance
+    #
+    # Therefore use mean_coverage ($2)
+    # ========================================================
+
+    awk '
+    BEGIN {
+        FS=OFS="\t"
+    }
+
+    NR==FNR {
+        keep[$1]=1
+        next
+    }
+
+    FNR==1 {
+        next
+    }
+
+    ($1 in keep) && $2 != "NA" && ($2+0) > 0 {
+        print $1, $2
+    }
+    ' "$CONTIG_LIST" "$COV" > "$OUT"
+
+    # ========================================================
+    # VALIDATE
+    # ========================================================
+
+    if [[ ! -s "$OUT" ]]; then
+
+        log "ERROR: No matching coverage entries produced"
+
+        return 1
+    fi
+
+    N_SHARED=$(wc -l < "$OUT")
+
+    log "Contigs with coverage: $N_SHARED"
+
+    if (( N_SHARED < 10 )); then
+        log "WARNING: Only $N_SHARED contigs have usable coverage"
+    fi
+
+    # ========================================================
+    # PREVIEW
+    # ========================================================
+
+    log "Preview:"
+    head -n 5 "$OUT"
+
+    log "Finished clean CoverM for $SAMPLE"
+
+    return 0
 }
 
-# MODE SELECTION
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
 
-if [[ -n "${TARGET_SAMPLE:-}" ]]; then
-    log "Running in MANUAL mode ($TARGET_SAMPLE)"
+if [[ -n "${SAMPLE:-}" ]]; then
 
-    COV="$COV_DIR/${TARGET_SAMPLE}.coverm.tsv"
-    SAMPLE="$TARGET_SAMPLE"
-    process_sample=true
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_clean_coverm "$SAMPLE"
 
 elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "Running in ARRAY mode"
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t COV_FILES < <(
+        find "$COV_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.coverage.tsv" \
+            | sort
+    )
+
+    N=${#COV_FILES[@]}
+
+    log "Coverage files detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No coverage files found"
+        exit 1
+    fi
 
     if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-        log "ERROR: Task ID out of range"
+
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+
         exit 1
     fi
 
     COV="${COV_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-    SAMPLE=$(basename "$COV" .coverm.tsv)
-    process_sample=true
+
+    SAMPLE=$(basename "$COV" .coverage.tsv)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} -> $SAMPLE"
+
+    run_clean_coverm "$SAMPLE"
 
 else
-    log "Running in NON-ARRAY mode"
-    process_sample=false
-fi
 
+    # --------------------------------------------------------
+    # LOCAL SEQUENTIAL MODE
+    # --------------------------------------------------------
 
-# FUNCTION
+    log "Running in local sequential mode"
 
-run_clean_coverm() {
+    mapfile -t COV_FILES < <(
+        find "$COV_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.coverage.tsv" \
+            | sort
+    )
 
-    local COV="$1"
-    local SAMPLE="$2"
+    N=${#COV_FILES[@]}
 
-    CLEAN_CONTIGS="$ASM_CLEAN_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
-    OUT="$OUT_DIR/${SAMPLE}.coverm.clean.tsv"
-
-    log "----------------------------------------"
-    log "Processing: $SAMPLE"
-
-    [[ -s "$COV" ]] || {
-        log "Missing CoverM file → skip"
-        return
-    }
-
-    [[ -s "$CLEAN_CONTIGS" ]] || {
-        log "Missing cleaned contigs → skip"
-        return
-    }
-
-    # -------------------- SKIP --------------------
-    if [[ -s "$OUT" && "${FORCE:-0}" != "1" ]]; then
-        log "Clean CoverM exists → skipping"
-        return
-    fi
-
-    TMP="$OUT_DIR/${SAMPLE}.tmp.tsv"
-
-    # -------------------- STEP 1: BASIC CLEAN --------------------
-    log "Filtering valid coverage entries"
-
-    awk '
-    NR==1 {next} 
-    $3 > 0 && $3 != "NA" {
-        print $1"\t"$3
-    }
-    ' "$COV" > "$TMP"
-
-    # -------------------- STEP 2: MATCH CONTIG NAMES --------------------
-    log "Matching with cleaned contigs"
-
-    grep "^>" "$CLEAN_CONTIGS" | sed 's/^>//' | sort > "$OUT_DIR/${SAMPLE}.contigs.list"
-    cut -f1 "$TMP" | sort > "$OUT_DIR/${SAMPLE}.coverm.list"
-
-    comm -12 \
-        "$OUT_DIR/${SAMPLE}.contigs.list" \
-        "$OUT_DIR/${SAMPLE}.coverm.list" \
-        > "$OUT_DIR/${SAMPLE}.shared.list"
-
-    N_SHARED=$(wc -l < "$OUT_DIR/${SAMPLE}.shared.list")
-
-    if [[ "$N_SHARED" -lt 10 ]]; then
-        log "ERROR: Too few matching contigs ($N_SHARED)"
+    if (( N == 0 )); then
+        log "ERROR: No coverage files found"
         exit 1
     fi
 
-    log "Matching contigs: $N_SHARED"
-
-    # -------------------- STEP 3: FILTER FINAL --------------------
-    grep -F -w -f "$OUT_DIR/${SAMPLE}.shared.list" "$TMP" > "$OUT"
-
-    [[ -s "$OUT" ]] || {
-        log "ERROR: Clean CoverM empty"
-        exit 1
-    }
-
-    rm -f "$TMP"
-
-    log "Final entries: $(wc -l < "$OUT")"
-    log "Finished: $SAMPLE"
-}
-
-# EXECUTION
-
-if [[ "$process_sample" == true ]]; then
-    run_clean_coverm "$COV" "$SAMPLE"
-else
     for COV in "${COV_FILES[@]}"; do
-        SAMPLE=$(basename "$COV" .coverm.tsv)
-        run_clean_coverm "$COV" "$SAMPLE"
+
+        SAMPLE=$(basename "$COV" .coverage.tsv)
+
+        run_clean_coverm "$SAMPLE"
+
     done
+
 fi
 
 log "CoverM cleaning completed"
+
 ;;
 
 # ============================================================
 ### BINNING (MAXBIN2 — CLEAN ASSEMBLY + CLEAN COVERM)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 binning_maxbin_prok)
 
@@ -2403,6 +3327,10 @@ set -euo pipefail
 shopt -s nullglob
 
 log "Starting MaxBin2 (clean assembly + clean CoverM)"
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 THREADS="${THREADS:-8}"
 MIN_LEN="${MIN_LEN:-1500}"
@@ -2415,144 +3343,404 @@ LOG_DIR="$OUTPUT_DIR/logs/binning_maxbin_prok"
 
 mkdir -p "$BIN_DIR" "$LOG_DIR"
 
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        s=$(basename "$d")
-        f="$d/${s}.contigs.clean.fa"
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
+log "THREADS: $THREADS"
+log "MIN_LEN: $MIN_LEN"
+log "ASM_DIR: $ASM_DIR"
+log "COV_DIR: $COV_DIR"
+log "BIN_DIR: $BIN_DIR"
 
-N=${#ASM_FILES[@]}
-log "Total assemblies: $N"
+# ============================================================
+# INPUT DIRECTORY CHECKS
+# ============================================================
 
-[[ "$N" -gt 0 ]] || { log "ERROR: No cleaned assemblies found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$CONTIGS" .contigs.clean.fa)
-
-COVERM="$COV_DIR/${SAMPLE}.coverm.clean.tsv"
-ABUND="$BIN_DIR/${SAMPLE}/${SAMPLE}.maxbin.tsv"
-
-OUTDIR="$BIN_DIR/$SAMPLE"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE"
-
-# -------------------- INPUT CHECK --------------------
-[[ -s "$CONTIGS" ]] || { log "Missing contigs → skip"; exit 0; }
-[[ -s "$COVERM" ]]  || { log "Missing clean coverm → skip"; exit 0; }
-
-# HANDLE INCOMPLETE OUTPUT
-
-if [[ -d "$OUTDIR" ]] && ! compgen -G "$OUTDIR/bin.*.fasta" > /dev/null; then
-    log "Incomplete run detected → cleaning"
-    rm -rf "$OUTDIR"
-fi
-
-# -------------------- SKIP --------------------
-if [[ -d "$OUTDIR" ]] && compgen -G "$OUTDIR/bin.*.fasta" > /dev/null \
-   && [[ "${FORCE:-0}" != "1" ]]; then
-    log "MaxBin2 already done → skipping"
-    exit 0
-fi
-
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR"
-
-
-# FILTER CONTIGS BY LENGTH
-
-FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
-
-log "Filtering contigs (min length = $MIN_LEN)"
-
-seqkit seq -m "$MIN_LEN" "$CONTIGS" > "$FILTERED_CONTIGS"
-
-[[ -s "$FILTERED_CONTIGS" ]] || {
-    log "ERROR: No contigs after filtering"
+[[ -d "$ASM_DIR" ]] || {
+    log "ERROR: Clean assembly directory not found:"
+    log "$ASM_DIR"
     exit 1
 }
 
-# PREPARE MAXBIN ABUNDANCE FILE (ALREADY CLEAN)
-
-log "Preparing abundance file for MaxBin"
-
-cp "$COVERM" "$ABUND"
-
-[[ -s "$ABUND" ]] || {
-    log "ERROR: Abundance file missing"
+[[ -d "$COV_DIR" ]] || {
+    log "ERROR: Clean CoverM directory not found:"
+    log "$COV_DIR"
     exit 1
 }
 
-log "Abundance entries: $(wc -l < "$ABUND")"
+# ============================================================
+# TOOL CHECKS
+# ============================================================
 
-# QUICK CONSISTENCY CHECK (SAFE, NON-BLOCKING)
+command -v run_MaxBin.pl >/dev/null 2>&1 || {
+    log "ERROR: run_MaxBin.pl not found"
+    exit 1
+}
 
-log "Checking contig overlap (sanity check)"
+command -v seqkit >/dev/null 2>&1 || {
+    log "ERROR: seqkit not found"
+    exit 1
+}
 
-grep "^>" "$FILTERED_CONTIGS" | sed 's/^>//' | sort > "$OUTDIR/contigs.list"
-cut -f1 "$ABUND" | sort > "$OUTDIR/abund.list"
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
 
-comm -12 "$OUTDIR/contigs.list" "$OUTDIR/abund.list" > "$OUTDIR/shared.list"
+run_maxbin() {
 
-N_SHARED=$(wc -l < "$OUTDIR/shared.list")
+    local SAMPLE="$1"
 
-if [[ "$N_SHARED" -lt 100 ]]; then
-    log "WARNING: Low overlap ($N_SHARED) — check upstream steps"
-else
+    local CONTIGS="$ASM_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
+
+    local COVERM="$COV_DIR/${SAMPLE}.coverm.clean.tsv"
+
+    local OUTDIR="$BIN_DIR/$SAMPLE"
+
+    local FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
+    local CONTIG_LIST="$OUTDIR/contigs.list"
+    local ABUND_LIST="$OUTDIR/abund.list"
+    local SHARED_LIST="$OUTDIR/shared.list"
+
+    local MATCHED_CONTIGS="$OUTDIR/${SAMPLE}.maxbin.input.fa"
+    local ABUND="$OUTDIR/${SAMPLE}.maxbin.tsv"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local N_SHARED=0
+    local N_BINS=0
+    local EXIT_CODE=0
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Clean assembly: $CONTIGS"
+    log "Clean CoverM: $COVERM"
+    log "Output directory: $OUTDIR"
+
+    # ========================================================
+    # INPUT CHECKS
+    # ========================================================
+
+    if [[ ! -e "$CONTIGS" ]]; then
+        log "ERROR: Clean assembly does not exist:"
+        log "$CONTIGS"
+        return 1
+    fi
+
+    if [[ ! -s "$CONTIGS" ]]; then
+        log "No clean contigs for $SAMPLE -> MaxBin2 not required"
+        return 0
+    fi
+
+    if [[ ! -e "$COVERM" ]]; then
+        log "ERROR: Clean CoverM file does not exist:"
+        log "$COVERM"
+        return 1
+    fi
+
+    if [[ ! -s "$COVERM" ]]; then
+        log "No usable coverage values for $SAMPLE -> MaxBin2 not required"
+        return 0
+    fi
+
+    # ========================================================
+    # SKIP IF COMPLETED
+    # ========================================================
+
+    if [[ "${FORCE:-0}" != "1" ]]; then
+
+        if [[ -f "$OUTDIR/MAXBIN_COMPLETE" ]]; then
+            log "MaxBin2 already completed -> skipping"
+            return 0
+        fi
+
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "MaxBin2 previously completed with no bins -> skipping"
+            return 0
+        fi
+
+        if [[ -d "$OUTDIR" ]] &&
+           compgen -G "$OUTDIR/bin.*.fasta" >/dev/null; then
+
+            log "MaxBin2 bins already exist -> skipping"
+            return 0
+        fi
+
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete MaxBin2 output:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # FILTER CONTIGS BY LENGTH
+    # ========================================================
+
+    log "Filtering contigs"
+    log "Minimum contig length: ${MIN_LEN} bp"
+
+    seqkit seq \
+        -m "$MIN_LEN" \
+        "$CONTIGS" \
+        > "$FILTERED_CONTIGS"
+
+    if [[ ! -s "$FILTERED_CONTIGS" ]]; then
+
+        log "No contigs >= ${MIN_LEN} bp"
+        log "Nothing to bin for $SAMPLE"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CHECK CONTIG / ABUNDANCE OVERLAP
+    # ========================================================
+
+    log "Checking contig-abundance consistency"
+
+    # FASTA IDs: first token only
+    awk '
+        /^>/ {
+            sub(/^>/,"")
+            split($0,a,/[\t ]/)
+            print a[1]
+        }
+    ' "$FILTERED_CONTIGS" \
+        | sort -u \
+        > "$CONTIG_LIST"
+
+    # CoverM abundance IDs
+    cut -f1 "$COVERM" \
+        | sort -u \
+        > "$ABUND_LIST"
+
+    comm -12 \
+        "$CONTIG_LIST" \
+        "$ABUND_LIST" \
+        > "$SHARED_LIST"
+
+    N_SHARED=$(wc -l < "$SHARED_LIST")
+
     log "Matching contigs: $N_SHARED"
+
+    if (( N_SHARED == 0 )); then
+
+        log "ERROR: No overlap between cleaned assembly and abundance file"
+
+        return 1
+
+    elif (( N_SHARED < 100 )); then
+
+        log "WARNING: Low contig-abundance overlap ($N_SHARED)"
+
+    fi
+
+    # ========================================================
+    # CREATE MATCHED FASTA
+    # ========================================================
+
+    log "Creating MaxBin FASTA containing shared contigs"
+
+    seqkit grep \
+        -f "$SHARED_LIST" \
+        "$FILTERED_CONTIGS" \
+        > "$MATCHED_CONTIGS"
+
+    if [[ ! -s "$MATCHED_CONTIGS" ]]; then
+        log "ERROR: Matched MaxBin FASTA is empty"
+        return 1
+    fi
+
+    # ========================================================
+    # CREATE MATCHED ABUNDANCE FILE
+    # ========================================================
+
+    log "Preparing abundance file for MaxBin"
+
+    awk '
+        BEGIN {
+            FS=OFS="\t"
+        }
+
+        NR==FNR {
+            keep[$1]=1
+            next
+        }
+
+        ($1 in keep) {
+            print $1, $2
+        }
+    ' "$SHARED_LIST" "$COVERM" \
+        > "$ABUND"
+
+    if [[ ! -s "$ABUND" ]]; then
+        log "ERROR: MaxBin abundance file is empty"
+        return 1
+    fi
+
+    log "Abundance entries: $(wc -l < "$ABUND")"
+
+    # ========================================================
+    # RUN MAXBIN2
+    # ========================================================
+
+    log "Running MaxBin2"
+    log "Input FASTA: $MATCHED_CONTIGS"
+    log "Abundance: $ABUND"
+
+    set +e
+
+    run_MaxBin.pl \
+        -contig "$MATCHED_CONTIGS" \
+        -abund "$ABUND" \
+        -out "$OUTDIR/bin" \
+        -thread "$THREADS" \
+        &>> "$LOGFILE"
+
+    EXIT_CODE=$?
+
+    set -e
+
+    log "MaxBin2 exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: MaxBin2 failed for $SAMPLE"
+        log "Last 50 lines of MaxBin log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE / COUNT BINS
+    # ========================================================
+
+    N_BINS=$(find "$OUTDIR" \
+        -maxdepth 1 \
+        -type f \
+        -name "bin.*.fasta" \
+        | wc -l)
+
+    if (( N_BINS == 0 )); then
+
+        log "MaxBin2 completed successfully but produced no bins"
+
+        touch "$OUTDIR/NO_BINS"
+
+    else
+
+        log "Bins produced: $N_BINS"
+
+        touch "$OUTDIR/MAXBIN_COMPLETE"
+
+    fi
+
+    log "Finished MaxBin2 for $SAMPLE"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility with older SLURM scripts
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
 fi
 
-# RUN MAXBIN2
+if [[ -n "${SAMPLE:-}" ]]; then
 
-log "Running MaxBin2"
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
 
-run_MaxBin.pl \
-    -contig "$FILTERED_CONTIGS" \
-    -abund "$ABUND" \
-    -out "$OUTDIR/bin" \
-    -thread "$THREADS" \
-    &>> "$LOG_DIR/${SAMPLE}.log"
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
 
-# -------------------- VALIDATE --------------------
-N_BINS=$(ls "$OUTDIR"/bin.*.fasta 2>/dev/null | wc -l || true)
+    run_maxbin "$SAMPLE"
 
-if [[ "$N_BINS" -eq 0 ]]; then
-    log "WARNING: No bins produced"
 else
-    log "Bins produced: $N_BINS"
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.clean.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total cleaned assemblies detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No cleaned assemblies found"
+        exit 1
+    fi
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$CONTIGS" .contigs.clean.fa)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_maxbin "$SAMPLE"
+
 fi
 
-log "Finished MaxBin2 for $SAMPLE"
+log "MaxBin2 prokaryotic binning step completed"
+
 ;;
 
 # ============================================================
-### BIN REFINEMENT (DAS TOOL — PROK, FINAL ROBUST VERSION)
+### BIN REFINEMENT (DAS TOOL — PROK)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 das_tool_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log() { echo "[$(date '+%F %T')] $*"; }
-
 log "Starting DAS Tool (prok bin refinement)"
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 THREADS="${THREADS:-16}"
 MIN_LEN="${MIN_LEN:-1500}"
@@ -2566,579 +3754,1028 @@ LOG_DIR="$OUTPUT_DIR/logs/das_tool_prok"
 
 mkdir -p "$DAS_DIR" "$LOG_DIR"
 
+log "THREADS: $THREADS"
+log "MIN_LEN: $MIN_LEN"
+log "MetaBAT directory: $MB_DIR"
+log "MaxBin directory: $MX_DIR"
+log "Clean assembly directory: $ASM_CLEAN_DIR"
+log "DAS Tool directory: $DAS_DIR"
+
 # ============================================================
-# DETECT INCOMPLETE SAMPLES (STRICT CHECK)
+# INPUT DIRECTORY CHECKS
 # ============================================================
-mapfile -t SAMPLES < <(
-    for d in "$MB_DIR"/*; do
-        [[ -d "$d" ]] || continue
 
-        SAMPLE=$(basename "$d")
+[[ -d "$ASM_CLEAN_DIR" ]] || {
+    log "ERROR: Clean assembly directory not found:"
+    log "$ASM_CLEAN_DIR"
+    exit 1
+}
 
-        OUTDIR="$DAS_DIR/$SAMPLE"
-        PREFIX="$OUTDIR/${SAMPLE}"
+[[ -d "$MB_DIR" ]] || {
+    log "ERROR: MetaBAT directory not found:"
+    log "$MB_DIR"
+    exit 1
+}
 
-        SUMMARY="${PREFIX}_DASTool_summary.tsv"
-        CONTIG2BIN="${PREFIX}_DASTool_contig2bin.tsv"
-        BINS_DIR="${PREFIX}_DASTool_bins"
+[[ -d "$MX_DIR" ]] || {
+    log "ERROR: MaxBin directory not found:"
+    log "$MX_DIR"
+    exit 1
+}
 
-        COMPLETE=0
+# ============================================================
+# TOOL CHECKS
+# ============================================================
 
-        if [[ -s "$SUMMARY" && -s "$CONTIG2BIN" && -d "$BINS_DIR" ]]; then
+command -v DAS_Tool >/dev/null 2>&1 || {
+    log "ERROR: DAS_Tool not found"
+    exit 1
+}
 
-            N_BINS=$(find "$BINS_DIR" -name "*.fa" | wc -l)
+command -v seqkit >/dev/null 2>&1 || {
+    log "ERROR: seqkit not found"
+    exit 1
+}
 
-            if [[ "$N_BINS" -gt 0 ]]; then
-                COMPLETE=1
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
+
+run_dastool() {
+
+    local SAMPLE="$1"
+
+    local MB="$MB_DIR/$SAMPLE"
+    local MX="$MX_DIR/$SAMPLE"
+
+    local ASM_CLEAN="$ASM_CLEAN_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
+
+    local OUTDIR="$DAS_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+
+    local FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
+    local CONTIG_LIST="$OUTDIR/contigs.list"
+
+    local MB_MAP_RAW="$OUTDIR/metabat_scaffolds2bin.raw.tsv"
+    local MX_MAP_RAW="$OUTDIR/maxbin_scaffolds2bin.raw.tsv"
+
+    local MB_MAP="$OUTDIR/metabat_scaffolds2bin.tsv"
+    local MX_MAP="$OUTDIR/maxbin_scaffolds2bin.tsv"
+
+    local SUMMARY_FILE="${PREFIX}_DASTool_summary.tsv"
+    local CONTIG2BIN_FILE="${PREFIX}_DASTool_contig2bin.tsv"
+    local BINS_DIR="${PREFIX}_DASTool_bins"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local INPUT_FILES=""
+    local LABELS=""
+    local N_INPUTS=0
+    local N_BINS=0
+    local N_SHARED=0
+    local EXIT_CODE=0
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Assembly: $ASM_CLEAN"
+    log "MetaBAT: $MB"
+    log "MaxBin: $MX"
+    log "Output: $OUTDIR"
+
+    # ========================================================
+    # INPUT CHECK: ASSEMBLY
+    # ========================================================
+
+    if [[ ! -e "$ASM_CLEAN" ]]; then
+        log "ERROR: Clean assembly does not exist:"
+        log "$ASM_CLEAN"
+        return 1
+    fi
+
+    if [[ ! -s "$ASM_CLEAN" ]]; then
+        log "No clean contigs for $SAMPLE -> DAS Tool not required"
+        return 0
+    fi
+
+    # ========================================================
+    # SKIP IF ALREADY COMPLETE
+    # ========================================================
+
+    if [[ "${FORCE:-0}" != "1" ]]; then
+
+        if [[ -f "$OUTDIR/DASTOOL_COMPLETE" ]]; then
+            log "DAS Tool already completed -> skipping"
+            return 0
+        fi
+
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "DAS Tool previously completed with no bins -> skipping"
+            return 0
+        fi
+
+        # Backward compatibility with older completed runs
+        if [[ -s "$SUMMARY_FILE" &&
+              -s "$CONTIG2BIN_FILE" &&
+              -d "$BINS_DIR" ]]; then
+
+            N_BINS=$(find "$BINS_DIR" \
+                -maxdepth 1 \
+                -type f \
+                -name "*.fa" \
+                | wc -l)
+
+            if (( N_BINS > 0 )); then
+                log "Existing DAS Tool result detected ($N_BINS bins) -> skipping"
+                return 0
             fi
         fi
 
-        if [[ "$COMPLETE" -eq 0 ]]; then
-            echo "$SAMPLE"
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete DAS Tool output:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # FILTER ASSEMBLY TO SAME MINIMUM LENGTH AS BINNING
+    # ========================================================
+
+    log "Filtering contigs"
+    log "Minimum length: ${MIN_LEN} bp"
+
+    seqkit seq \
+        -m "$MIN_LEN" \
+        "$ASM_CLEAN" \
+        > "$FILTERED_CONTIGS"
+
+    if [[ ! -s "$FILTERED_CONTIGS" ]]; then
+
+        log "No contigs >= ${MIN_LEN} bp"
+        log "Nothing available for DAS Tool"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # ASSEMBLY CONTIG IDS
+    # ========================================================
+
+    awk '
+        /^>/ {
+            sub(/^>/,"")
+            split($0,a,/[\t ]/)
+            print a[1]
+        }
+    ' "$FILTERED_CONTIGS" \
+        | sort -u \
+        > "$CONTIG_LIST"
+
+    # ========================================================
+    # CREATE METABAT SCAFFOLD2BIN
+    # ========================================================
+
+    : > "$MB_MAP_RAW"
+
+    if [[ -d "$MB" ]]; then
+
+        for f in "$MB"/bin*.fa; do
+
+            [[ -s "$f" ]] || continue
+
+            BIN=$(basename "$f" .fa)
+
+            awk -v bin="$BIN" '
+                /^>/ {
+                    sub(/^>/,"")
+                    split($0,a,/[\t ]/)
+                    print a[1] "\t" bin
+                }
+            ' "$f"
+
+        done \
+            | sort -u \
+            > "$MB_MAP_RAW"
+
+    fi
+
+    # ========================================================
+    # CREATE MAXBIN SCAFFOLD2BIN
+    # ========================================================
+
+    : > "$MX_MAP_RAW"
+
+    if [[ -d "$MX" ]]; then
+
+        for f in "$MX"/bin.*.fasta; do
+
+            [[ -s "$f" ]] || continue
+
+            BIN=$(basename "$f" .fasta)
+
+            awk -v bin="$BIN" '
+                /^>/ {
+                    sub(/^>/,"")
+                    split($0,a,/[\t ]/)
+                    print a[1] "\t" bin
+                }
+            ' "$f"
+
+        done \
+            | sort -u \
+            > "$MX_MAP_RAW"
+
+    fi
+
+    # ========================================================
+    # FILTER MAPS TO CONTIGS PRESENT IN DAS TOOL ASSEMBLY
+    # ========================================================
+
+    awk '
+        BEGIN {FS=OFS="\t"}
+
+        NR==FNR {
+            keep[$1]=1
+            next
+        }
+
+        ($1 in keep) {
+            print
+        }
+    ' "$CONTIG_LIST" "$MB_MAP_RAW" \
+        > "$MB_MAP"
+
+    awk '
+        BEGIN {FS=OFS="\t"}
+
+        NR==FNR {
+            keep[$1]=1
+            next
+        }
+
+        ($1 in keep) {
+            print
+        }
+    ' "$CONTIG_LIST" "$MX_MAP_RAW" \
+        > "$MX_MAP"
+
+    # ========================================================
+    # BUILD DAS TOOL INPUT LIST
+    # ========================================================
+
+    if [[ -s "$MB_MAP" ]]; then
+
+        INPUT_FILES="$MB_MAP"
+        LABELS="metabat"
+        N_INPUTS=$((N_INPUTS + 1))
+
+        log "MetaBAT scaffold2bin entries: $(wc -l < "$MB_MAP")"
+    else
+        log "WARNING: No usable MetaBAT bins for $SAMPLE"
+    fi
+
+    if [[ -s "$MX_MAP" ]]; then
+
+        if [[ -n "$INPUT_FILES" ]]; then
+            INPUT_FILES="${INPUT_FILES},${MX_MAP}"
+            LABELS="${LABELS},maxbin"
+        else
+            INPUT_FILES="$MX_MAP"
+            LABELS="maxbin"
         fi
 
-    done | sort
-)
+        N_INPUTS=$((N_INPUTS + 1))
 
-N=${#SAMPLES[@]}
-
-log "Samples needing DAS Tool: $N"
-
-[[ "$N" -gt 0 ]] || {
-    log "Nothing to run — all samples complete"
-    exit 0
-}
-
-# ============================================================
-# SINGLE-SAMPLE OVERRIDE
-# ============================================================
-if [[ -n "${TARGET_SAMPLE:-}" ]]; then
-
-    log "TARGET_SAMPLE detected: $TARGET_SAMPLE"
-
-    SAMPLES=("$TARGET_SAMPLE")
-    N=1
-
-    SLURM_ARRAY_TASK_ID=1
-fi
-
-# ============================================================
-# ARRAY CHECK
-# ============================================================
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample for this index → exiting"
-    exit 0
-fi
-
-# ============================================================
-# SELECT SAMPLE
-# ============================================================
-SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-
-MB="$MB_DIR/$SAMPLE"
-MX="$MX_DIR/$SAMPLE"
-
-ASM_CLEAN="$ASM_CLEAN_DIR/$SAMPLE/${SAMPLE}.contigs.clean.fa"
-
-OUTDIR="$DAS_DIR/$SAMPLE"
-PREFIX="$OUTDIR/${SAMPLE}"
-
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
-
-# ============================================================
-# INPUT CHECK
-# ============================================================
-[[ -d "$MB" && -d "$MX" ]] || {
-    log "Missing MetaBAT or MaxBin directory → skipping"
-    exit 0
-}
-
-[[ -s "$ASM_CLEAN" ]] || {
-    log "Missing clean contigs file → skipping"
-    exit 0
-}
-
-# ============================================================
-# FINAL OUTPUT CHECK (EXTRA SAFETY)
-# ============================================================
-SUMMARY_FILE="${PREFIX}_DASTool_summary.tsv"
-CONTIG2BIN_FILE="${PREFIX}_DASTool_contig2bin.tsv"
-BINS_DIR="${PREFIX}_DASTool_bins"
-
-if [[ -s "$SUMMARY_FILE" && -s "$CONTIG2BIN_FILE" && -d "$BINS_DIR" ]]; then
-
-    N_BINS=$(find "$BINS_DIR" -name "*.fa" | wc -l)
-
-    if [[ "$N_BINS" -gt 0 ]]; then
-        log "Sample already completed successfully → skipping"
-        exit 0
-    fi
-fi
-
-# ============================================================
-# CLEAN PARTIAL OUTPUTS ONLY
-# ============================================================
-if [[ -d "$OUTDIR" ]]; then
-    log "Removing incomplete/partial output directory"
-    rm -rf "$OUTDIR"
-fi
-
-mkdir -p "$OUTDIR"
-
-# ============================================================
-# FILTER CONTIGS (MATCH BINNING LENGTH)
-# ============================================================
-FILTERED_CONTIGS="$OUTDIR/${SAMPLE}.min${MIN_LEN}.fa"
-
-log "Filtering contigs (minimum length = $MIN_LEN bp)"
-
-seqkit seq -m "$MIN_LEN" "$ASM_CLEAN" > "$FILTERED_CONTIGS"
-
-[[ -s "$FILTERED_CONTIGS" ]] || {
-    log "ERROR: No contigs remaining after filtering"
-    exit 1
-}
-
-# ============================================================
-# CREATE SCAFFOLD2BIN FILES
-# ============================================================
-log "Creating scaffold2bin mapping files"
-
-MB_MAP="$OUTDIR/metabat_scaffolds2bin.tsv"
-MX_MAP="$OUTDIR/maxbin_scaffolds2bin.tsv"
-
-# -------------------- MetaBAT --------------------
-for f in "$MB"/bin*.fa; do
-    [[ -s "$f" ]] || continue
-
-    BIN=$(basename "$f" .fa)
-
-    grep "^>" "$f" | \
-        sed 's/^>//' | \
-        awk -v bin="$BIN" '{print $1"\t"bin}'
-
-done | sort -u > "$MB_MAP"
-
-# -------------------- MaxBin --------------------
-for f in "$MX"/bin*.fasta; do
-    [[ -s "$f" ]] || continue
-
-    BIN=$(basename "$f" .fasta)
-
-    grep "^>" "$f" | \
-        sed 's/^>//' | \
-        awk -v bin="$BIN" '{print $1"\t"bin}'
-
-done | sort -u > "$MX_MAP"
-
-# ============================================================
-# CHECK INPUT MAPS
-# ============================================================
-if [[ ! -s "$MB_MAP" && ! -s "$MX_MAP" ]]; then
-    log "ERROR: No scaffold2bin mappings generated"
-    exit 1
-fi
-
-if [[ ! -s "$MB_MAP" || ! -s "$MX_MAP" ]]; then
-    log "WARNING: One binning method missing"
-fi
-
-# ============================================================
-# CONSISTENCY CHECK
-# ============================================================
-log "Checking contig consistency"
-
-grep "^>" "$FILTERED_CONTIGS" | \
-    sed 's/^>//' | \
-    sort > "$OUTDIR/contigs.list"
-
-cat "$MB_MAP" "$MX_MAP" | \
-    cut -f1 | \
-    sort -u > "$OUTDIR/bin_contigs.list"
-
-comm -12 \
-    "$OUTDIR/contigs.list" \
-    "$OUTDIR/bin_contigs.list" \
-    > "$OUTDIR/shared.list"
-
-N_SHARED=$(wc -l < "$OUTDIR/shared.list")
-
-log "Shared contigs between bins and assembly: $N_SHARED"
-
-if [[ "$N_SHARED" -lt 100 ]]; then
-    log "ERROR: Low overlap between binned contigs and filtered assembly"
-    exit 1
-fi
-
-# ============================================================
-# RUN DAS TOOL
-# ============================================================
-log "Running DAS Tool"
-
-set +e
-
-DAS_Tool \
-    -i "$MB_MAP,$MX_MAP" \
-    -c "$FILTERED_CONTIGS" \
-    -o "$PREFIX" \
-    --labels metabat,maxbin \
-    --threads "$THREADS" \
-    --search_engine diamond \
-    --write_bins \
-    --score_threshold 0.5 \
-    &>> "$LOG_DIR/${SAMPLE}.log"
-
-EXIT_CODE=$?
-
-set -e
-
-log "DAS Tool exit code: $EXIT_CODE"
-
-if [[ "$EXIT_CODE" -ne 0 ]]; then
-    log "DAS Tool crashed — showing last 50 log lines"
-
-    tail -n 50 "$LOG_DIR/${SAMPLE}.log"
-
-    exit 1
-fi
-
-# ============================================================
-# VALIDATION
-# ============================================================
-SUMMARY_FILE="${PREFIX}_DASTool_summary.tsv"
-CONTIG2BIN_FILE="${PREFIX}_DASTool_contig2bin.tsv"
-BINS_DIR="${PREFIX}_DASTool_bins"
-
-if [[ -s "$SUMMARY_FILE" && -s "$CONTIG2BIN_FILE" && -d "$BINS_DIR" ]]; then
-
-    N_BINS=$(find "$BINS_DIR" -name "*.fa" | wc -l)
-
-    if [[ "$N_BINS" -gt 0 ]]; then
-        log "SUCCESS: DAS Tool produced $N_BINS refined bins"
+        log "MaxBin scaffold2bin entries: $(wc -l < "$MX_MAP")"
     else
-        log "ERROR: No refined bins produced"
+        log "WARNING: No usable MaxBin bins for $SAMPLE"
+    fi
+
+    # ========================================================
+    # NO BINS FROM EITHER METHOD
+    # ========================================================
+
+    if (( N_INPUTS == 0 )); then
+
+        log "Neither MetaBAT nor MaxBin produced usable bins"
+        log "DAS Tool not required"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    if (( N_INPUTS == 1 )); then
+        log "WARNING: Only one binning method produced usable bins"
+        log "DAS Tool will run with the available bin set only"
+    fi
+
+    # ========================================================
+    # CONSISTENCY CHECK
+    # ========================================================
+
+    log "Checking contig consistency"
+
+    cat "$MB_MAP" "$MX_MAP" \
+        | awk -F'\t' 'NF > 0 {print $1}' \
+        | sort -u \
+        > "$OUTDIR/bin_contigs.list"
+
+    comm -12 \
+        "$CONTIG_LIST" \
+        "$OUTDIR/bin_contigs.list" \
+        > "$OUTDIR/shared.list"
+
+    N_SHARED=$(wc -l < "$OUTDIR/shared.list")
+
+    log "Shared contigs between bins and assembly: $N_SHARED"
+
+    if (( N_SHARED == 0 )); then
+
+        log "ERROR: No overlap between binned contigs and assembly"
+
+        return 1
+
+    elif (( N_SHARED < 100 )); then
+
+        log "WARNING: Low overlap between bins and assembly ($N_SHARED)"
+
+    fi
+
+    # ========================================================
+    # RUN DAS TOOL
+    # ========================================================
+
+    log "Running DAS Tool"
+    log "Input bin sets: $INPUT_FILES"
+    log "Labels: $LABELS"
+
+    set +e
+
+    DAS_Tool \
+        -i "$INPUT_FILES" \
+        -c "$FILTERED_CONTIGS" \
+        -o "$PREFIX" \
+        --labels "$LABELS" \
+        --threads "$THREADS" \
+        --search_engine diamond \
+        --write_bins \
+        --score_threshold 0.5 \
+        &>> "$LOGFILE"
+
+    EXIT_CODE=$?
+
+    set -e
+
+    log "DAS Tool exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: DAS Tool failed for $SAMPLE"
+        log "Last 50 lines of DAS Tool log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATION
+    # ========================================================
+
+    if [[ -d "$BINS_DIR" ]]; then
+
+        N_BINS=$(find "$BINS_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.fa" \
+            | wc -l)
+
+    else
+
+        N_BINS=0
+    fi
+
+    if (( N_BINS > 0 )); then
+
+        if [[ ! -s "$SUMMARY_FILE" ]]; then
+            log "ERROR: DAS Tool bins exist but summary file is missing"
+            return 1
+        fi
+
+        if [[ ! -s "$CONTIG2BIN_FILE" ]]; then
+            log "ERROR: DAS Tool bins exist but contig2bin file is missing"
+            return 1
+        fi
+
+        log "SUCCESS: DAS Tool produced $N_BINS refined bins"
+
+        touch "$OUTDIR/DASTOOL_COMPLETE"
+
+    else
+
+        log "DAS Tool completed successfully but selected no refined bins"
+        log "This is treated as a valid zero-bin result"
+
+        touch "$OUTDIR/NO_BINS"
+
+    fi
+
+    log "Finished DAS Tool for $SAMPLE"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility with older scripts
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
+
+    run_dastool "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # Stable list based on cleaned assemblies.
+    # Do NOT build an array from only incomplete samples.
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_CLEAN_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.clean.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total cleaned assemblies detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No cleaned assemblies found"
         exit 1
     fi
 
-else
-    log "ERROR: DAS Tool output incomplete"
-    exit 1
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.clean.fa)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_dastool "$SAMPLE"
+
 fi
 
-log "Finished DAS Tool for $SAMPLE"
+log "DAS Tool prokaryotic refinement step completed"
 
 ;;
 
 # ============================================================
-### CHECKM (PROK QUALITY — FROM DAS TOOL, PER-SAMPLE)
+### CHECKM (PROK QUALITY — FROM DAS TOOL)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 checkm_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting CheckM (from DAS Tool)"
+log "Starting CheckM (from DAS Tool refined bins)"
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 THREADS="${THREADS:-16}"
+MIN_SIZE="${MIN_SIZE:-50000}"
 
 DAS_DIR="$OUTPUT_DIR/das_tool_prok"
+ASM_CLEAN_DIR="$OUTPUT_DIR/assembly_clean"
+
 CHECKM_DIR="$OUTPUT_DIR/checkm_prok"
 LOG_DIR="$OUTPUT_DIR/logs/checkm_prok"
 
 mkdir -p "$CHECKM_DIR" "$LOG_DIR"
 
-# ============================================================
-# COLLECT VALID DAS TOOL SAMPLES
-# ============================================================
-mapfile -t SAMPLES < <(
-
-    for d in "$DAS_DIR"/*; do
-
-        [[ -d "$d" ]] || continue
-
-        SAMPLE=$(basename "$d")
-
-        BINS_DIR="$d/${SAMPLE}_DASTool_bins"
-
-        if [[ -d "$BINS_DIR" ]] && \
-           compgen -G "$BINS_DIR/*.fa" > /dev/null; then
-
-            echo "$SAMPLE"
-        fi
-
-    done | sort
-)
+log "THREADS: $THREADS"
+log "MIN_SIZE: $MIN_SIZE"
+log "DAS_DIR: $DAS_DIR"
+log "CHECKM_DIR: $CHECKM_DIR"
 
 # ============================================================
-# COUNT SAMPLES
+# INPUT DIRECTORY CHECKS
 # ============================================================
-N=${#SAMPLES[@]}
 
-log "Total samples detected: $N"
-
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No valid DAS Tool samples found"
+[[ -d "$DAS_DIR" ]] || {
+    log "ERROR: DAS Tool directory not found:"
+    log "$DAS_DIR"
     exit 1
 }
 
-# ============================================================
-# ARRAY CHECK
-# ============================================================
-[[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || {
-    log "ERROR: Run as SLURM array job"
+[[ -d "$ASM_CLEAN_DIR" ]] || {
+    log "ERROR: Clean assembly directory not found:"
+    log "$ASM_CLEAN_DIR"
     exit 1
 }
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample assigned to this array index → exiting"
-    exit 0
-fi
-
-# ============================================================
-# SELECT SAMPLE
-# ============================================================
-SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-
-BIN_DIR="$DAS_DIR/$SAMPLE/${SAMPLE}_DASTool_bins"
-
-OUTDIR="$CHECKM_DIR/$SAMPLE"
-
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
-
-# ============================================================
-# INPUT CHECK
-# ============================================================
-[[ -d "$BIN_DIR" ]] || {
-    log "Missing DAS Tool bins directory → skipping"
-    exit 0
-}
-
-BINS=("$BIN_DIR"/*.fa)
-
-if ! compgen -G "$BIN_DIR/*.fa" > /dev/null; then
-    log "No DAS Tool bins found → skipping"
-    exit 0
-fi
-
-# ============================================================
-# SKIP COMPLETED
-# ============================================================
-if [[ -s "$OUTDIR/storage/bin_stats_ext.tsv" &&
-      -s "$OUTDIR/${SAMPLE}_qa.tsv" &&
-      "${FORCE:-0}" != "1" ]]; then
-
-    log "CheckM already completed successfully → skipping"
-    exit 0
-fi
-
-# ============================================================
-# CLEAN PARTIAL OUTPUTS
-# ============================================================
-if [[ -d "$OUTDIR" ]]; then
-    log "Removing incomplete CheckM output"
-    rm -rf "$OUTDIR"
-fi
-
-mkdir -p "$OUTDIR/input"
-
-# ============================================================
-# FILTER SMALL BINS
-# ============================================================
-MIN_SIZE=50000
-
-N_KEPT=0
-
-log "Filtering bins smaller than ${MIN_SIZE} bp"
-
-for BIN in "${BINS[@]}"; do
-
-    SIZE=$(grep -v "^>" "$BIN" | tr -d '\n' | wc -c)
-
-    if (( SIZE >= MIN_SIZE )); then
-        cp "$BIN" "$OUTDIR/input/"
-        ((++N_KEPT))
-    fi
-done
-
-log "Bins retained after filtering: $N_KEPT"
-
-[[ "$N_KEPT" -gt 0 ]] || {
-    log "No bins passed minimum size filter → skipping"
-    exit 0
-}
-
-# ============================================================
-# RUN CHECKM
-# ============================================================
-log "Running CheckM lineage_wf"
-log "This may take considerable time"
-
-set +e
-
-checkm lineage_wf \
-    -x fa \
-    "$OUTDIR/input" \
-    "$OUTDIR" \
-    -t "$THREADS" \
-    &>> "$LOG_DIR/${SAMPLE}.log"
-
-EXIT_CODE=$?
-
-set -e
-
-log "CheckM exit code: $EXIT_CODE"
-
-if [[ "$EXIT_CODE" -ne 0 ]]; then
-
-    log "CheckM failed — showing last 50 log lines"
-
-    tail -n 50 "$LOG_DIR/${SAMPLE}.log"
-
-    exit 1
-fi
-
-# ============================================================
-# VALIDATE OUTPUTS
-# ============================================================
-[[ -s "$OUTDIR/storage/bin_stats_ext.tsv" &&
-   -s "$OUTDIR/lineage.ms" ]] || {
-
-    log "ERROR: CheckM outputs incomplete"
-
-    exit 1
-}
-
-log "Finished CheckM for $SAMPLE"
-
-;;
-
-# ============================================================
-### CHECKM QA REGENERATION (FAST RE-RUN)
-# ============================================================
-checkm_qa_prok)
-
-set -euo pipefail
-shopt -s nullglob
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-log "Starting CheckM QA generation"
-
-CHECKM_DIR="$OUTPUT_DIR/checkm_prok"
-
-# ============================================================
-# LOAD MODULES
-# ============================================================
-module --force purge
-module load cluster/genius/login
-module load CheckM/1.2.3-foss-2023b
 
 # ============================================================
 # TOOL CHECK
 # ============================================================
-command -v checkm >/dev/null || {
-    log "ERROR: checkm not found"
+
+command -v checkm >/dev/null 2>&1 || {
+    log "ERROR: CheckM not found"
     exit 1
 }
 
 # ============================================================
-# INPUT CHECK
+# FUNCTION: PROCESS ONE SAMPLE
 # ============================================================
-[[ -d "$CHECKM_DIR" ]] || {
-    log "ERROR: Missing CheckM directory"
-    exit 1
-}
 
-# ============================================================
-# LOOP OVER SAMPLES
-# ============================================================
-for OUTDIR in "$CHECKM_DIR"/*; do
+run_checkm() {
 
-    [[ -d "$OUTDIR" ]] || continue
+    local SAMPLE="$1"
 
-    SAMPLE=$(basename "$OUTDIR")
+    local DAS_SAMPLE_DIR="$DAS_DIR/$SAMPLE"
+    local BIN_DIR="$DAS_SAMPLE_DIR/${SAMPLE}_DASTool_bins"
 
-    LINEAGE="$OUTDIR/lineage.ms"
+    local OUTDIR="$CHECKM_DIR/$SAMPLE"
+    local INPUT_DIR="$OUTDIR/input"
 
-    [[ -s "$LINEAGE" ]] || {
-        log "Missing lineage.ms for $SAMPLE → skipping"
-        continue
-    }
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
 
-    [[ -s "$OUTDIR/storage/bin_stats_ext.tsv" ]] || {
-        log "Missing bin_stats_ext.tsv for $SAMPLE → skipping"
-        continue
-    }
+    local QA_FILE="$OUTDIR/${SAMPLE}_qa.tsv"
+    local LINEAGE_FILE="$OUTDIR/lineage.ms"
+    local BIN_STATS="$OUTDIR/storage/bin_stats_ext.tsv"
+
+    local N_KEPT=0
+    local EXIT_CODE=0
+    local QA_EXIT=0
 
     log "----------------------------------------"
-    log "Generating QA table for: $SAMPLE"
+    log "Processing sample: $SAMPLE"
+    log "DAS Tool sample directory: $DAS_SAMPLE_DIR"
+    log "DAS Tool bins: $BIN_DIR"
+    log "CheckM output: $OUTDIR"
+
+    # ========================================================
+    # CHECK UPSTREAM DAS TOOL STATUS
+    # ========================================================
+
+    if [[ -f "$DAS_SAMPLE_DIR/NO_BINS" ]]; then
+
+        log "DAS Tool produced no refined bins for $SAMPLE"
+        log "CheckM not required"
+
+        mkdir -p "$OUTDIR"
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CHECK FOR COMPLETED CHECKM OUTPUT
+    # ========================================================
+
+    if [[ "${FORCE:-0}" != "1" ]]; then
+
+        if [[ -f "$OUTDIR/CHECKM_COMPLETE" ]]; then
+            log "CheckM already completed -> skipping"
+            return 0
+        fi
+
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "No bins previously available for CheckM -> skipping"
+            return 0
+        fi
+
+        # Backward compatibility with completed runs
+        if [[ -s "$BIN_STATS" &&
+              -s "$LINEAGE_FILE" &&
+              -s "$QA_FILE" ]]; then
+
+            log "Existing complete CheckM outputs detected -> skipping"
+            return 0
+        fi
+
+    fi
+
+    # ========================================================
+    # CHECK DAS TOOL BIN DIRECTORY
+    # ========================================================
+
+    if [[ ! -d "$BIN_DIR" ]]; then
+
+        log "ERROR: DAS Tool bins directory missing:"
+        log "$BIN_DIR"
+
+        log "If DAS Tool legitimately produced no bins, a NO_BINS marker"
+        log "should exist in:"
+        log "$DAS_SAMPLE_DIR"
+
+        return 1
+    fi
+
+    # ========================================================
+    # COLLECT DAS TOOL BINS
+    # ========================================================
+
+    local BINS=("$BIN_DIR"/*.fa)
+
+    if (( ${#BINS[@]} == 0 )); then
+
+        log "ERROR: DAS Tool bin directory exists but contains no .fa bins"
+        log "Upstream DAS Tool output may be incomplete"
+
+        return 1
+    fi
+
+    log "DAS Tool bins detected: ${#BINS[@]}"
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete CheckM output:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$INPUT_DIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # FILTER SMALL BINS
+    # ========================================================
+
+    log "Filtering bins smaller than ${MIN_SIZE} bp"
+
+    for BIN in "${BINS[@]}"; do
+
+        [[ -s "$BIN" ]] || continue
+
+        # Calculate total sequence length robustly
+        SIZE=$(awk '
+            !/^>/ {
+                gsub(/[[:space:]]/, "")
+                total += length($0)
+            }
+            END {
+                print total + 0
+            }
+        ' "$BIN")
+
+        BIN_NAME=$(basename "$BIN")
+
+        if (( SIZE >= MIN_SIZE )); then
+
+            cp "$BIN" "$INPUT_DIR/$BIN_NAME"
+
+            N_KEPT=$((N_KEPT + 1))
+
+            log "KEEP: $BIN_NAME (${SIZE} bp)"
+
+        else
+
+            log "DROP: $BIN_NAME (${SIZE} bp < ${MIN_SIZE} bp)"
+
+        fi
+
+    done
+
+    log "Bins retained after size filtering: $N_KEPT"
+
+    # ========================================================
+    # NO BINS AFTER SIZE FILTER
+    # ========================================================
+
+    if (( N_KEPT == 0 )); then
+
+        log "No DAS Tool bins >= ${MIN_SIZE} bp"
+        log "CheckM not required"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # RUN CHECKM LINEAGE WORKFLOW
+    # ========================================================
+
+    log "Running CheckM lineage_wf"
+    log "Input bins: $INPUT_DIR"
+
+    set +e
+
+    checkm lineage_wf \
+        -x fa \
+        -t "$THREADS" \
+        "$INPUT_DIR" \
+        "$OUTDIR" \
+        &>> "$LOGFILE"
+
+    EXIT_CODE=$?
+
+    set -e
+
+    log "CheckM lineage_wf exit code: $EXIT_CODE"
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: CheckM lineage_wf failed for $SAMPLE"
+        log "Last 50 lines of CheckM log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE LINEAGE WORKFLOW
+    # ========================================================
+
+    if [[ ! -s "$LINEAGE_FILE" ]]; then
+        log "ERROR: CheckM lineage file missing:"
+        log "$LINEAGE_FILE"
+        return 1
+    fi
+
+    if [[ ! -s "$BIN_STATS" ]]; then
+        log "ERROR: CheckM bin statistics missing:"
+        log "$BIN_STATS"
+        return 1
+    fi
+
+    # ========================================================
+    # GENERATE PERSISTENT QA TABLE
+    # ========================================================
+
+    log "Generating CheckM QA table"
+
+    set +e
 
     checkm qa \
-        "$LINEAGE" \
+        "$LINEAGE_FILE" \
         "$OUTDIR" \
-        -o 1 \
-        > "$OUTDIR/${SAMPLE}_qa.tsv"
+        -o 2 \
+        --tab_table \
+        -f "$QA_FILE" \
+        &>> "$LOGFILE"
 
-    [[ -s "$OUTDIR/${SAMPLE}_qa.tsv" ]] || {
-        log "ERROR: QA generation failed for $SAMPLE"
+    QA_EXIT=$?
+
+    set -e
+
+    log "CheckM QA exit code: $QA_EXIT"
+
+    if (( QA_EXIT != 0 )); then
+
+        log "ERROR: CheckM QA failed for $SAMPLE"
+        log "Last 50 lines of CheckM log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$QA_EXIT"
+    fi
+
+    # ========================================================
+    # FINAL VALIDATION
+    # ========================================================
+
+    if [[ ! -s "$QA_FILE" ]]; then
+
+        log "ERROR: CheckM QA table was not created:"
+        log "$QA_FILE"
+
+        return 1
+    fi
+
+    if [[ ! -s "$LINEAGE_FILE" ]]; then
+
+        log "ERROR: CheckM lineage file missing"
+
+        return 1
+    fi
+
+    if [[ ! -s "$BIN_STATS" ]]; then
+
+        log "ERROR: CheckM bin statistics missing"
+
+        return 1
+    fi
+
+    # ========================================================
+    # COMPLETE MARKER
+    # ========================================================
+
+    touch "$OUTDIR/CHECKM_COMPLETE"
+
+    log "SUCCESS: CheckM completed for $SAMPLE"
+    log "QA table:"
+    log "$QA_FILE"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
+
+    run_checkm "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    #
+    # IMPORTANT:
+    # Use a stable upstream source for array indexing.
+    # Do NOT generate the array from only samples currently
+    # containing DAS Tool bins.
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_CLEAN_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.clean.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total cleaned assemblies detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No cleaned assemblies found"
         exit 1
-    }
+    fi
 
-    log "Finished QA generation for $SAMPLE"
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
 
-done
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
 
-log "Finished CheckM QA regeneration"
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.clean.fa)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_checkm "$SAMPLE"
+
+fi
+
+log "CheckM prokaryotic quality assessment step completed"
 
 ;;
 
+
 # ============================================================
-### CHECKM CLASSIFICATION (FROM DAS TOOL BINS)
+### CHECKM CLASSIFICATION
+### FROM DAS TOOL BINS — GLOBAL / NON-ARRAY STEP
 # ============================================================
 checkm_classify_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log() { echo "[$(date '+%F %T')] $*"; }
+log "Starting CheckM-based MAG classification"
 
-log "Starting CheckM classification"
+# ============================================================
+# CONFIG
+# ============================================================
 
 CHECKM_DIR="$OUTPUT_DIR/checkm_prok"
 DAS_DIR="$OUTPUT_DIR/das_tool_prok"
 
 CLASS_DIR="$OUTPUT_DIR/checkm_classified_prok"
 
-SUMMARY="$CLASS_DIR/checkm_summary.tsv"
+# Temporary working directory.
+# Existing successful classification is preserved until
+# the new classification finishes successfully.
+WORK_DIR="${CLASS_DIR}.tmp.$$"
+
+SUMMARY="$WORK_DIR/checkm_summary.tsv"
 
 # ============================================================
-# PREP OUTPUT DIRECTORIES
+# INPUT CHECKS
 # ============================================================
-mkdir -p "$CLASS_DIR"/{HQ,MQ,LQ}
 
-# Clean previous outputs
-rm -f "$SUMMARY"
+[[ -d "$CHECKM_DIR" ]] || {
+    log "ERROR: CheckM directory not found:"
+    log "$CHECKM_DIR"
+    exit 1
+}
 
-rm -rf "$CLASS_DIR"/HQ/*
-rm -rf "$CLASS_DIR"/MQ/*
-rm -rf "$CLASS_DIR"/LQ/*
+[[ -d "$DAS_DIR" ]] || {
+    log "ERROR: DAS Tool directory not found:"
+    log "$DAS_DIR"
+    exit 1
+}
 
 # ============================================================
-# HEADER
+# PREP TEMPORARY OUTPUT
 # ============================================================
-echo -e "Sample\tBin\tCompleteness\tContamination\tCategory" \
+
+rm -rf "$WORK_DIR"
+
+mkdir -p \
+    "$WORK_DIR/HQ" \
+    "$WORK_DIR/MQ" \
+    "$WORK_DIR/LQ"
+
+# ============================================================
+# SUMMARY HEADER
+# ============================================================
+
+printf "Sample\tBin\tCompleteness\tContamination\tCategory\n" \
     > "$SUMMARY"
 
 # ============================================================
-# LOOP OVER SAMPLES
+# COUNTERS
 # ============================================================
+
+N_SAMPLES=0
+N_BINS_TOTAL=0
+N_MISSING_BIN=0
+
+# ============================================================
+# LOOP OVER CHECKM SAMPLE DIRECTORIES
+# ============================================================
+
 for SAMPLE_DIR in "$CHECKM_DIR"/*; do
 
     [[ -d "$SAMPLE_DIR" ]] || continue
@@ -3147,284 +4784,613 @@ for SAMPLE_DIR in "$CHECKM_DIR"/*; do
 
     QA_FILE="$SAMPLE_DIR/${SAMPLE}_qa.tsv"
 
-    BIN_DIR="$DAS_DIR/$SAMPLE/${SAMPLE}_DASTool_bins"
+    DAS_SAMPLE_DIR="$DAS_DIR/$SAMPLE"
+    BIN_DIR="$DAS_SAMPLE_DIR/${SAMPLE}_DASTool_bins"
 
     # --------------------------------------------------------
-    # INPUT CHECKS
+    # VALID NO-BIN SAMPLE
     # --------------------------------------------------------
-    [[ -s "$QA_FILE" ]] || {
-        log "Missing QA file for $SAMPLE → skipping"
-        continue
-    }
 
-    [[ -d "$BIN_DIR" ]] || {
-        log "Missing DAS Tool bins for $SAMPLE → skipping"
+    if [[ -f "$SAMPLE_DIR/NO_BINS" ]]; then
+        log "$SAMPLE: CheckM reports NO_BINS -> skipping"
         continue
-    }
+    fi
 
+    # --------------------------------------------------------
+    # QA INPUT
+    # --------------------------------------------------------
+
+    if [[ ! -s "$QA_FILE" ]]; then
+        log "WARNING: Missing CheckM QA file for $SAMPLE -> skipping"
+        continue
+    fi
+
+    if [[ ! -d "$BIN_DIR" ]]; then
+        log "WARNING: Missing DAS Tool bin directory for $SAMPLE -> skipping"
+        continue
+    fi
+
+    log "----------------------------------------"
     log "Processing sample: $SAMPLE"
+    log "QA file: $QA_FILE"
+    log "Bin directory: $BIN_DIR"
 
-    TMPFILE="$CLASS_DIR/tmp_${SAMPLE}.tsv"
+    TMP_MAP="$WORK_DIR/${SAMPLE}.classification.tmp.tsv"
 
-    rm -f "$TMPFILE"
+    rm -f "$TMP_MAP"
 
     # ========================================================
-    # PARSE CHECKM QA FILE
+    # PARSE CHECKM QA TABLE
+    #
+    # QA was generated previously with:
+    #
+    #   checkm qa ... --tab_table -o 2
+    #
+    # Therefore parse by column NAME instead of assuming
+    # fixed numeric positions.
     # ========================================================
+
     awk \
-    -v sample="$SAMPLE" \
-    -v out="$SUMMARY" \
-    -v tmp="$TMPFILE" \
+        -F '\t' \
+        -v OFS='\t' \
+        -v sample="$SAMPLE" \
+        -v summary="$SUMMARY" \
+        -v map="$TMP_MAP" \
     '
     BEGIN {
-        OFS="\t"
+        comp_col = 0
+        cont_col = 0
+        bin_col  = 1
     }
 
     # --------------------------------------------------------
-    # Skip logs / separators / headers
+    # Detect header and required columns
     # --------------------------------------------------------
-    /^\[/ { next }
-    /^---/ { next }
-    /Bin Id/ { next }
+    /Bin Id/ {
 
-    {
-        line = $0
+        for (i = 1; i <= NF; i++) {
 
-        # Remove leading whitespace
-        sub(/^[[:space:]]+/, "", line)
+            field = $i
 
-        # Split line
-        n = split(line, a, /[[:space:]]+/)
+            gsub(/^[[:space:]]+/, "", field)
+            gsub(/[[:space:]]+$/, "", field)
 
-        if (n < 5)
-            next
+            if (field == "Bin Id")
+                bin_col = i
 
-        bin = a[1]
+            if (field == "Completeness")
+                comp_col = i
 
-        # ----------------------------------------------------
-        # Keep only real bins
-        # ----------------------------------------------------
-        if (bin !~ /bin/)
-            next
-
-        # ----------------------------------------------------
-        # Extract numeric columns
-        # ----------------------------------------------------
-        nnums = 0
-
-        for (i = 1; i <= n; i++) {
-
-            if (a[i] ~ /^[0-9.]+$/) {
-
-                nums[++nnums] = a[i]
-            }
+            if (field == "Contamination")
+                cont_col = i
         }
 
-        # Need:
-        # completeness contamination strain_heterogeneity
-        if (nnums < 3)
+        next
+    }
+
+    # --------------------------------------------------------
+    # Skip non-data lines
+    # --------------------------------------------------------
+    /^[[:space:]]*$/ {
+        next
+    }
+
+    /^\[/ {
+        next
+    }
+
+    /^-+/ {
+        next
+    }
+
+    # --------------------------------------------------------
+    # Data rows
+    # --------------------------------------------------------
+    {
+
+        if (comp_col == 0 || cont_col == 0)
             next
 
-        # ----------------------------------------------------
-        # Final numeric columns:
-        # completeness contamination strain_heterogeneity
-        # ----------------------------------------------------
-        comp = nums[nnums-2] + 0
-        cont = nums[nnums-1] + 0
+        bin  = $bin_col
+        comp = $comp_col
+        cont = $cont_col
+
+        # Trim whitespace
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", bin)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", comp)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", cont)
+
+        # Require numeric completeness and contamination
+        if (comp !~ /^[0-9]+([.][0-9]+)?$/)
+            next
+
+        if (cont !~ /^[0-9]+([.][0-9]+)?$/)
+            next
+
+        comp += 0
+        cont += 0
 
         # ----------------------------------------------------
-        # Classification
+        # CheckM-based quality classification
         # ----------------------------------------------------
+
         if (comp >= 90 && cont <= 5)
-            cat = "HQ"
+            category = "HQ"
+
         else if (comp >= 50 && cont <= 10)
-            cat = "MQ"
+            category = "MQ"
+
         else
-            cat = "LQ"
+            category = "LQ"
 
         # ----------------------------------------------------
-        # Write summary
+        # Global summary
         # ----------------------------------------------------
-        print sample, bin, comp, cont, cat >> out
 
-        # Temporary mapping for copying bins
-        print bin, cat >> tmp
+        print sample, bin, comp, cont, category >> summary
+
+        # ----------------------------------------------------
+        # Bin -> category mapping
+        # ----------------------------------------------------
+
+        print bin, category >> map
+    }
+
+    END {
+
+        if (comp_col == 0) {
+            print "ERROR: Completeness column not found" > "/dev/stderr"
+            exit 2
+        }
+
+        if (cont_col == 0) {
+            print "ERROR: Contamination column not found" > "/dev/stderr"
+            exit 2
+        }
     }
     ' "$QA_FILE"
 
     # ========================================================
+    # MAKE SURE QA CONTAINED BIN RESULTS
+    # ========================================================
+
+    if [[ ! -s "$TMP_MAP" ]]; then
+
+        log "ERROR: No CheckM bin records parsed for $SAMPLE"
+        log "Check QA file:"
+        log "$QA_FILE"
+
+        exit 1
+    fi
+
+    N_SAMPLES=$((N_SAMPLES + 1))
+
+    # ========================================================
     # COPY CLASSIFIED BINS
     # ========================================================
-    if [[ -s "$TMPFILE" ]]; then
 
-        while IFS=$'\t' read -r BIN CATEGORY; do
+    while IFS=$'\t' read -r BIN CATEGORY; do
 
-            MATCH=$(find "$BIN_DIR" -name "${BIN}.fa" | head -n 1)
+        [[ -n "$BIN" ]] || continue
+        [[ -n "$CATEGORY" ]] || continue
 
-            if [[ -n "$MATCH" && -s "$MATCH" ]]; then
+        SOURCE_BIN="$BIN_DIR/${BIN}.fa"
 
-                cp "$MATCH" \
-                   "$CLASS_DIR/$CATEGORY/${SAMPLE}_$(basename "$MATCH")"
+        if [[ -s "$SOURCE_BIN" ]]; then
 
-            else
-                log "WARNING: Missing source bin for $BIN"
-            fi
+            DEST_BIN="$WORK_DIR/$CATEGORY/${SAMPLE}_${BIN}.fa"
 
-        done < "$TMPFILE"
+            cp "$SOURCE_BIN" "$DEST_BIN"
 
-        rm -f "$TMPFILE"
-    fi
+            N_BINS_TOTAL=$((N_BINS_TOTAL + 1))
+
+        else
+
+            log "WARNING: CheckM bin not found in DAS Tool output:"
+            log "$SOURCE_BIN"
+
+            N_MISSING_BIN=$((N_MISSING_BIN + 1))
+        fi
+
+    done < "$TMP_MAP"
+
+    rm -f "$TMP_MAP"
 
 done
 
 # ============================================================
+# VERIFY THAT SOMETHING WAS CLASSIFIED
+# ============================================================
+
+if (( N_SAMPLES == 0 )); then
+
+    log "ERROR: No samples with usable CheckM QA results were found"
+
+    rm -rf "$WORK_DIR"
+
+    exit 1
+fi
+
+# ============================================================
 # FINAL COUNTS
 # ============================================================
-HQ_N=$(find "$CLASS_DIR/HQ" -name "*.fa" | wc -l)
-MQ_N=$(find "$CLASS_DIR/MQ" -name "*.fa" | wc -l)
-LQ_N=$(find "$CLASS_DIR/LQ" -name "*.fa" | wc -l)
 
+HQ_N=$(find "$WORK_DIR/HQ" \
+    -maxdepth 1 \
+    -type f \
+    -name "*.fa" \
+    | wc -l)
+
+MQ_N=$(find "$WORK_DIR/MQ" \
+    -maxdepth 1 \
+    -type f \
+    -name "*.fa" \
+    | wc -l)
+
+LQ_N=$(find "$WORK_DIR/LQ" \
+    -maxdepth 1 \
+    -type f \
+    -name "*.fa" \
+    | wc -l)
+
+SUMMARY_N=$(awk 'NR > 1 {n++} END {print n+0}' "$SUMMARY")
+
+log "----------------------------------------"
+log "Samples classified: $N_SAMPLES"
+log "CheckM records: $SUMMARY_N"
+log "Bins copied: $N_BINS_TOTAL"
 log "HQ bins: $HQ_N"
 log "MQ bins: $MQ_N"
 log "LQ bins: $LQ_N"
+log "Missing source bins: $N_MISSING_BIN"
 
-log "Finished CheckM classification"
+# ============================================================
+# CONSISTENCY CHECK
+# ============================================================
+
+COPIED_N=$((HQ_N + MQ_N + LQ_N))
+
+if (( COPIED_N != N_BINS_TOTAL )); then
+
+    log "ERROR: Internal bin count mismatch"
+    log "Copied counter: $N_BINS_TOTAL"
+    log "Files detected: $COPIED_N"
+
+    rm -rf "$WORK_DIR"
+
+    exit 1
+fi
+
+if (( N_MISSING_BIN > 0 )); then
+
+    log "ERROR: $N_MISSING_BIN CheckM bins could not be matched"
+    log "to the original DAS Tool FASTA files."
+    log "Classification will NOT replace the existing output."
+
+    rm -rf "$WORK_DIR"
+
+    exit 1
+fi
+
+# ============================================================
+# MARK COMPLETE
+# ============================================================
+
+touch "$WORK_DIR/CLASSIFICATION_COMPLETE"
+
+# ============================================================
+# REPLACE OLD CLASSIFICATION ONLY AFTER SUCCESS
+# ============================================================
+
+log "Classification validated successfully"
+
+if [[ -d "$CLASS_DIR" ]]; then
+
+    log "Removing previous classification directory:"
+    log "$CLASS_DIR"
+
+    rm -rf "$CLASS_DIR"
+fi
+
+mv "$WORK_DIR" "$CLASS_DIR"
+
+# ============================================================
+# FINAL OUTPUT
+# ============================================================
+
+log "----------------------------------------"
+log "CheckM classification completed successfully"
+log "Summary:"
+log "$CLASS_DIR/checkm_summary.tsv"
+log "HQ bins: $HQ_N"
+log "MQ bins: $MQ_N"
+log "LQ bins: $LQ_N"
 
 ;;
 
 # ============================================================
 ### CHECKM SUMMARY PER SAMPLE
+### GLOBAL / NON-ARRAY STEP
 # ============================================================
 checkm_summary_sample_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log() { echo "[$(date '+%F %T')] $*"; }
-
-IN="$OUTPUT_DIR/checkm_classified_prok/checkm_summary.tsv"
-
-CHECKM_DIR="$OUTPUT_DIR/checkm_prok"
-
-OUT="$OUTPUT_DIR/checkm_classified_prok/checkm_summary_per_sample.tsv"
-
 log "Creating CheckM per-sample summary"
 
 # ============================================================
-# GET ALL SAMPLES
+# PATHS
 # ============================================================
-mapfile -t ALL_SAMPLES < <(
 
-    for d in "$CHECKM_DIR"/*; do
+CLASS_DIR="$OUTPUT_DIR/checkm_classified_prok"
 
-        [[ -d "$d" ]] || continue
+IN="$CLASS_DIR/checkm_summary.tsv"
 
-        basename "$d"
+CHECKM_DIR="$OUTPUT_DIR/checkm_prok"
+ASM_CLEAN_DIR="$OUTPUT_DIR/assembly_clean"
 
-    done | sort
-)
+OUT="$CLASS_DIR/checkm_summary_per_sample.tsv"
+
+TMP_SAMPLES="$CLASS_DIR/.checkm_samples.$$"
+TMP_STATS="$CLASS_DIR/.checkm_stats.$$"
 
 # ============================================================
-# BUILD SUMMARY
+# INPUT CHECKS
 # ============================================================
-awk '
-BEGIN {
-    FS="\t"
-    OFS="\t"
+
+[[ -s "$IN" ]] || {
+    log "ERROR: CheckM classification summary missing:"
+    log "$IN"
+    exit 1
 }
 
-NR == 1 { next }
+[[ -d "$CHECKM_DIR" ]] || {
+    log "ERROR: CheckM directory missing:"
+    log "$CHECKM_DIR"
+    exit 1
+}
+
+[[ -d "$ASM_CLEAN_DIR" ]] || {
+    log "ERROR: Clean assembly directory missing:"
+    log "$ASM_CLEAN_DIR"
+    exit 1
+}
+
+# ============================================================
+# CLEANUP TEMP FILES ON EXIT
+# ============================================================
+
+cleanup_checkm_summary() {
+    rm -f "$TMP_SAMPLES" "$TMP_STATS"
+}
+
+trap cleanup_checkm_summary EXIT
+
+# ============================================================
+# GET STABLE LIST OF ALL SAMPLES
+#
+# Use assembly_clean rather than checkm_prok so samples that
+# produced no CheckM results are still represented.
+# ============================================================
+
+find "$ASM_CLEAN_DIR" \
+    -mindepth 1 \
+    -maxdepth 1 \
+    -type d \
+    -printf '%f\n' \
+    | sort -V \
+    > "$TMP_SAMPLES"
+
+N_SAMPLES=$(wc -l < "$TMP_SAMPLES")
+
+if (( N_SAMPLES == 0 )); then
+    log "ERROR: No samples found in:"
+    log "$ASM_CLEAN_DIR"
+    exit 1
+fi
+
+log "Total samples detected: $N_SAMPLES"
+
+# ============================================================
+# AGGREGATE CHECKM RESULTS
+# ============================================================
+
+awk '
+BEGIN {
+    FS = OFS = "\t"
+}
+
+NR == 1 {
+    next
+}
 
 {
     sample = $1
-    comp_v = $3 + 0
-    cont_v = $4 + 0
-    cat = $5
+    comp   = $3 + 0
+    cont   = $4 + 0
+    cat    = $5
 
-    comp[sample] += comp_v
-    cont[sample] += cont_v
+    sum_comp[sample] += comp
+    sum_cont[sample] += cont
+
     n[sample]++
 
     if (cat == "HQ")
         HQ[sample]++
+
     else if (cat == "MQ")
         MQ[sample]++
+
     else if (cat == "LQ")
         LQ[sample]++
 }
 
 END {
 
-    for (s in n) {
+    for (sample in n) {
 
-        mean_comp[s] = comp[s] / n[s]
-        mean_cont[s] = cont[s] / n[s]
-    }
+        mean_comp = sum_comp[sample] / n[sample]
+        mean_cont = sum_cont[sample] / n[sample]
 
-    for (s in mean_comp) {
-
-        print s,
-              mean_comp[s],
-              mean_cont[s],
-              n[s],
-              (s in HQ ? HQ[s] : 0),
-              (s in MQ ? MQ[s] : 0),
-              (s in LQ ? LQ[s] : 0)
+        print sample,
+              mean_comp,
+              mean_cont,
+              n[sample],
+              (sample in HQ ? HQ[sample] : 0),
+              (sample in MQ ? MQ[sample] : 0),
+              (sample in LQ ? LQ[sample] : 0)
     }
 }
-' "$IN" > "$OUT.tmp"
+' "$IN" > "$TMP_STATS"
 
 # ============================================================
-# FINAL TABLE WITH ALL SAMPLES
+# BUILD FINAL TABLE
 # ============================================================
+
+printf \
+"sample\tmean_completeness\tmean_contamination\tn_bins_assessed\tHQ\tMQ\tLQ\tstatus\n" \
+> "$OUT"
+
+awk \
+    -F '\t' \
+    -v OFS='\t' \
+    -v checkm_dir="$CHECKM_DIR" \
+'
+# ------------------------------------------------------------
+# First file = aggregated statistics
+# ------------------------------------------------------------
+
+NR == FNR {
+
+    stats[$1] = $0
+
+    next
+}
+
+# ------------------------------------------------------------
+# Second file = complete stable sample list
+# ------------------------------------------------------------
+
 {
-    echo -e "sample\tmean_completeness\tmean_contamination\tn_bins\tHQ\tMQ\tLQ"
+    sample = $1
 
-    for SAMPLE in "${ALL_SAMPLES[@]}"; do
+    if (sample in stats) {
 
-        LINE=$(awk -F'\t' -v s="$SAMPLE" '$1==s' "$OUT.tmp")
+        print stats[sample], "classified"
 
-        if [[ -n "$LINE" ]]; then
+    } else {
 
-            echo "$LINE"
+        no_bins = checkm_dir "/" sample "/NO_BINS"
 
+        cmd = "test -f \"" no_bins "\""
+
+        if (system(cmd) == 0)
+            status = "NO_BINS"
         else
+            status = "NO_CHECKM_RESULT"
 
-            echo -e "${SAMPLE}\t0\t0\t0\t0\t0\t0"
-        fi
-    done
+        print sample,
+              "NA",
+              "NA",
+              0,
+              0,
+              0,
+              0,
+              status
+    }
+}
+' "$TMP_STATS" "$TMP_SAMPLES" \
+>> "$OUT"
 
-} > "$OUT"
+# ============================================================
+# VALIDATION
+# ============================================================
 
-rm -f "$OUT.tmp"
+[[ -s "$OUT" ]] || {
+    log "ERROR: Per-sample summary was not created"
+    exit 1
+}
 
-log "Created: $OUT"
+N_ROWS=$(awk 'NR > 1 {n++} END {print n+0}' "$OUT")
+
+if (( N_ROWS != N_SAMPLES )); then
+
+    log "ERROR: Output row count does not match sample count"
+    log "Expected: $N_SAMPLES"
+    log "Observed: $N_ROWS"
+
+    exit 1
+fi
+
+# ============================================================
+# REPORT
+# ============================================================
+
+N_CLASSIFIED=$(awk -F'\t' '
+    NR > 1 && $8 == "classified" {n++}
+    END {print n+0}
+' "$OUT")
+
+N_NO_BINS=$(awk -F'\t' '
+    NR > 1 && $8 == "NO_BINS" {n++}
+    END {print n+0}
+' "$OUT")
+
+N_NO_RESULT=$(awk -F'\t' '
+    NR > 1 && $8 == "NO_CHECKM_RESULT" {n++}
+    END {print n+0}
+' "$OUT")
+
+TOTAL_HQ=$(awk -F'\t' '
+    NR > 1 {n += $5}
+    END {print n+0}
+' "$OUT")
+
+TOTAL_MQ=$(awk -F'\t' '
+    NR > 1 {n += $6}
+    END {print n+0}
+' "$OUT")
+
+TOTAL_LQ=$(awk -F'\t' '
+    NR > 1 {n += $7}
+    END {print n+0}
+' "$OUT")
+
+log "----------------------------------------"
+log "Per-sample CheckM summary created:"
+log "$OUT"
+log "Samples represented: $N_ROWS"
+log "Samples with classified bins: $N_CLASSIFIED"
+log "Samples with NO_BINS: $N_NO_BINS"
+log "Samples with no CheckM result: $N_NO_RESULT"
+log "Total HQ bins: $TOTAL_HQ"
+log "Total MQ bins: $TOTAL_MQ"
+log "Total LQ bins: $TOTAL_LQ"
 
 ;;
 
 # ============================================================
-### BAT (BIN-LEVEL — PROKARYOTIC MAGS)
+### BAT (BIN-LEVEL — PROKARYOTIC MAGs)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 bat_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log() {
-    echo "[$(date '+%F %T')] $*"
-}
-
-log "Starting BAT (prok MAG taxonomy)"
+log "Starting BAT (prokaryotic MAG taxonomy)"
 
 # ============================================================
-# SETTINGS
+# CONFIG
 # ============================================================
+
 THREADS="${THREADS:-8}"
 
 CLASS_DIR="$OUTPUT_DIR/checkm_classified_prok"
+SUMMARY="$CLASS_DIR/checkm_summary.tsv"
 
 BAT_DIR="$OUTPUT_DIR/bat_prok"
-
 LOG_DIR="$OUTPUT_DIR/logs/bat_prok"
 
 CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
@@ -3435,16 +5401,58 @@ CAT_CMD="${CAT_CMD:-CAT_pack}"
 
 mkdir -p "$BAT_DIR" "$LOG_DIR"
 
+log "THREADS: $THREADS"
+log "CLASS_DIR: $CLASS_DIR"
+log "BAT_DIR: $BAT_DIR"
+
+# ============================================================
+# INPUT CHECKS
+# ============================================================
+
+[[ -d "$CLASS_DIR" ]] || {
+    log "ERROR: CheckM classification directory not found:"
+    log "$CLASS_DIR"
+    exit 1
+}
+
+[[ -s "$SUMMARY" ]] || {
+    log "ERROR: CheckM classification summary not found:"
+    log "$SUMMARY"
+    exit 1
+}
+
+[[ -f "$CLASS_DIR/CLASSIFICATION_COMPLETE" ]] || {
+    log "ERROR: CheckM classification is not marked complete:"
+    log "$CLASS_DIR/CLASSIFICATION_COMPLETE"
+    exit 1
+}
+
+for CATEGORY in HQ MQ LQ; do
+
+    [[ -d "$CLASS_DIR/$CATEGORY" ]] || {
+        log "ERROR: Missing classification directory:"
+        log "$CLASS_DIR/$CATEGORY"
+        exit 1
+    }
+
+done
+
 # ============================================================
 # DEPENDENCY CHECKS
 # ============================================================
-command -v "$CAT_CMD" >/dev/null || {
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
     log "ERROR: CAT_pack not found"
     exit 1
 }
 
-command -v diamond >/dev/null || {
+command -v diamond >/dev/null 2>&1 || {
     log "ERROR: DIAMOND not found"
+    exit 1
+}
+
+command -v python >/dev/null 2>&1 || {
+    log "ERROR: Python not found"
     exit 1
 }
 
@@ -3456,218 +5464,351 @@ python -c "import pyrodigal" >/dev/null 2>&1 || {
 # ============================================================
 # DATABASE CHECKS
 # ============================================================
+
 [[ -d "$CAT_DB" ]] || {
-    log "ERROR: Missing CAT database"
+    log "ERROR: CAT database not found:"
+    log "$CAT_DB"
     exit 1
 }
 
 [[ -d "$CAT_TAX" ]] || {
-    log "ERROR: Missing CAT taxonomy"
+    log "ERROR: CAT taxonomy directory not found:"
+    log "$CAT_TAX"
     exit 1
 }
 
 # ============================================================
-# COLLECT SAMPLES
+# FUNCTION: PROCESS ONE SAMPLE
 # ============================================================
-mapfile -t SAMPLES < <(
 
-    find "$CLASS_DIR"/HQ \
-         "$CLASS_DIR"/MQ \
-         "$CLASS_DIR"/LQ \
-         -maxdepth 1 \
-         -type f \
-         -name "*.fa" \
-         2>/dev/null \
-    | xargs -n 1 basename \
-    | cut -d'_' -f1 \
-    | sort -u
-)
+run_bat_prok() {
 
-N=${#SAMPLES[@]}
+    local SAMPLE="$1"
 
-log "Total samples detected: $N"
+    local OUTDIR="$BAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+    local BINS_TMP="$OUTDIR/bins"
 
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No classified MAG samples found"
-    exit 1
+    local CLASS_FILE="${PREFIX}.bin2classification.txt"
+    local ORF_FILE="${PREFIX}.ORF2LCA.txt"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local N_BINS=0
+    local EXIT_CODE=0
+
+    # ========================================================
+    # SAMPLE TEMP DIRECTORY
+    # ========================================================
+
+    local TMP_ROOT="${TMPDIR:-/tmp}"
+    local SAMPLE_TMP="${TMP_ROOT}/bat_${SAMPLE}"
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+
+    # ========================================================
+    # SKIP COMPLETED
+    # ========================================================
+
+    if [[ "${FORCE:-0}" != "1" ]]; then
+
+        if [[ -f "$OUTDIR/BAT_COMPLETE" ]]; then
+            log "BAT already completed -> skipping"
+            return 0
+        fi
+
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "No classified MAGs for this sample -> skipping"
+            return 0
+        fi
+
+        # Backward compatibility with older BAT results
+        if [[ -s "$CLASS_FILE" && -s "$ORF_FILE" ]]; then
+
+            log "Existing complete BAT outputs detected -> skipping"
+
+            touch "$OUTDIR/BAT_COMPLETE"
+
+            return 0
+        fi
+
+    fi
+
+    # ========================================================
+    # FIND CLASSIFIED MAGS
+    # ========================================================
+
+    local SAMPLE_BINS=()
+
+    mapfile -t SAMPLE_BINS < <(
+        find \
+            "$CLASS_DIR/HQ" \
+            "$CLASS_DIR/MQ" \
+            "$CLASS_DIR/LQ" \
+            -maxdepth 1 \
+            -type f \
+            -name "${SAMPLE}_*.fa" \
+            -size +0c \
+            | sort -V
+    )
+
+    N_BINS=${#SAMPLE_BINS[@]}
+
+    log "Classified MAGs detected: $N_BINS"
+
+    # ========================================================
+    # VALID ZERO-BIN RESULT
+    # ========================================================
+
+    if (( N_BINS == 0 )); then
+
+        log "No classified MAGs found for $SAMPLE"
+        log "BAT not required"
+
+        rm -rf "$OUTDIR"
+        mkdir -p "$OUTDIR"
+
+        touch "$OUTDIR/NO_BINS"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete BAT output:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$BINS_TMP"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # PREPARE SAMPLE MAG DIRECTORY
+    #
+    # Use symlinks rather than duplicating all MAG FASTAs.
+    # ========================================================
+
+    log "Preparing BAT input directory"
+
+    for BIN in "${SAMPLE_BINS[@]}"; do
+
+        [[ -s "$BIN" ]] || continue
+
+        BASENAME=$(basename "$BIN")
+
+        if [[ -e "$BINS_TMP/$BASENAME" ]]; then
+
+            log "ERROR: Duplicate MAG filename detected:"
+            log "$BASENAME"
+
+            return 1
+        fi
+
+        ln -s "$BIN" "$BINS_TMP/$BASENAME"
+
+    done
+
+    # ========================================================
+    # VERIFY BIN COUNT
+    # ========================================================
+
+    N_LINKED=$(find "$BINS_TMP" \
+        -maxdepth 1 \
+        -type l \
+        -name "*.fa" \
+        | wc -l)
+
+    log "MAGs prepared for BAT: $N_LINKED"
+
+    if (( N_LINKED != N_BINS )); then
+
+        log "ERROR: Input MAG count mismatch"
+        log "Expected: $N_BINS"
+        log "Prepared: $N_LINKED"
+
+        return 1
+    fi
+
+    # ========================================================
+    # PREP TEMP DIRECTORY
+    # ========================================================
+
+    rm -rf "$SAMPLE_TMP"
+    mkdir -p "$SAMPLE_TMP"
+
+    export TMPDIR="$SAMPLE_TMP"
+    export TEMP="$SAMPLE_TMP"
+    export TMP="$SAMPLE_TMP"
+
+    log "BAT TMPDIR: $TMPDIR"
+
+    # ========================================================
+    # RUN BAT
+    # ========================================================
+
+    log "Running CAT_pack bins (BAT)"
+    log "Input MAGs: $N_BINS"
+
+    set +e
+
+    "$CAT_CMD" bins \
+        -b "$BINS_TMP" \
+        -d "$CAT_DB" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --bin_suffix .fa \
+        --nproc "$THREADS" \
+        --block_size 2 \
+        --tmpdir "$TMPDIR" \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "BAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: BAT failed for $SAMPLE"
+        log "Last 50 lines of BAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE OUTPUTS
+    # ========================================================
+
+    if [[ ! -s "$CLASS_FILE" ]]; then
+
+        log "ERROR: BAT bin2classification output missing:"
+        log "$CLASS_FILE"
+
+        return 1
+    fi
+
+    if [[ ! -s "$ORF_FILE" ]]; then
+
+        log "ERROR: BAT ORF2LCA output missing:"
+        log "$ORF_FILE"
+
+        return 1
+    fi
+
+    # ========================================================
+    # MARK COMPLETE
+    # ========================================================
+
+    rm -f "$OUTDIR/NO_BINS"
+
+    touch "$OUTDIR/BAT_COMPLETE"
+
+    # ========================================================
+    # CLEAN TEMP
+    # ========================================================
+
+    rm -rf "$SAMPLE_TMP"
+
+    log "SUCCESS: BAT completed for $SAMPLE"
+    log "Classification:"
+    log "$CLASS_FILE"
+
+    return 0
 }
 
 # ============================================================
-# ARRAY CHECK
+# SAMPLE SELECTION
 # ============================================================
-[[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || {
-    log "ERROR: Run as SLURM array job"
-    exit 1
-}
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-
-    log "No sample assigned to this array index → exiting"
-
-    exit 0
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
 fi
 
-# ============================================================
-# SELECT SAMPLE
-# ============================================================
-SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+if [[ -n "${SAMPLE:-}" ]]; then
 
-OUTDIR="$BAT_DIR/$SAMPLE"
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
 
-PREFIX="$OUTDIR/${SAMPLE}"
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
 
-BINS_TMP="$OUTDIR/bins"
+    run_bat_prok "$SAMPLE"
 
-# ============================================================
-# LOCAL TMPDIR (VERY IMPORTANT FOR DIAMOND)
-# ============================================================
-SAMPLE_TMP="${TMPDIR:-/tmp}/${SAMPLE}"
+else
 
-mkdir -p "$SAMPLE_TMP"
+    # --------------------------------------------------------
+    # ARRAY MODE
+    #
+    # Use the finished CheckM classification summary as the
+    # stable source of samples rather than discovering samples
+    # from changing output directories.
+    # --------------------------------------------------------
 
-export TMPDIR="$SAMPLE_TMP"
-export TEMP="$SAMPLE_TMP"
-export TMP="$SAMPLE_TMP"
+    log "Running in array mode"
 
-log "Using sample TMPDIR: $TMPDIR"
+    mapfile -t SAMPLES < <(
+        awk -F '\t' '
+            NR > 1 && $1 != "" {
+                print $1
+            }
+        ' "$SUMMARY" \
+        | sort -Vu
+    )
 
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
+    N=${#SAMPLES[@]}
 
-# ============================================================
-# SKIP COMPLETED
-# ============================================================
-if [[ -s "${PREFIX}.bin2classification.txt" &&
-      -s "${PREFIX}.ORF2LCA.txt" &&
-      "${FORCE:-0}" != "1" ]]; then
+    log "Samples with classified MAGs: $N"
 
-    log "BAT already completed successfully → skipping"
+    if (( N == 0 )); then
+        log "ERROR: No classified MAG samples found"
+        exit 1
+    fi
 
-    exit 0
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 ||
+          SLURM_ARRAY_TASK_ID > N )); then
+
+        log "ERROR: Array task ${SLURM_ARRAY_TASK_ID} outside range 1-$N"
+
+        exit 1
+    fi
+
+    SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_bat_prok "$SAMPLE"
+
 fi
 
-# ============================================================
-# CLEAN PARTIAL OUTPUTS
-# ============================================================
-if [[ -d "$OUTDIR" ]]; then
-
-    log "Removing incomplete BAT output"
-
-    rm -rf "$OUTDIR"
-fi
-
-mkdir -p "$BINS_TMP"
-
-# ============================================================
-# COLLECT SAMPLE MAGS
-# ============================================================
-N_BINS=0
-
-mapfile -t SAMPLE_BINS < <(
-
-    find "$CLASS_DIR"/HQ \
-         "$CLASS_DIR"/MQ \
-         "$CLASS_DIR"/LQ \
-         -maxdepth 1 \
-         -type f \
-         -name "${SAMPLE}_*.fa" \
-         | sort
-)
-
-for BIN in "${SAMPLE_BINS[@]}"; do
-
-    [[ -s "$BIN" ]] || continue
-
-    cp "$BIN" "$BINS_TMP/"
-
-    ((++N_BINS))
-done
-
-log "Bins copied for sample: $N_BINS"
-
-[[ "$N_BINS" -gt 0 ]] || {
-    log "ERROR: No MAGs found for sample"
-    exit 1
-}
-
-# ============================================================
-# DEBUG
-# ============================================================
-log "Files inside BAT bins directory:"
-
-ls -lh "$BINS_TMP"
-
-# ============================================================
-# RUN BAT
-# ============================================================
-log "Running CAT_pack BAT"
-
-set +e
-
-"$CAT_CMD" bins \
-    -b "$BINS_TMP" \
-    -d "$CAT_DB" \
-    -t "$CAT_TAX" \
-    -o "$PREFIX" \
-    --bin_suffix .fa \
-    --nproc "$THREADS" \
-    --block_size 2 \
-    --tmpdir "$TMPDIR" \
-    2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-EXIT_CODE=${PIPESTATUS[0]}
-
-set -e
-
-log "BAT exit code: $EXIT_CODE"
-
-# ============================================================
-# HANDLE FAILURE
-# ============================================================
-if [[ "$EXIT_CODE" -ne 0 ]]; then
-
-    log "BAT failed — showing last 50 log lines"
-
-    tail -n 50 "$LOG_DIR/${SAMPLE}.log"
-
-    exit 1
-fi
-
-# ============================================================
-# VALIDATE OUTPUTS
-# ============================================================
-CLASS_FILE="${PREFIX}.bin2classification.txt"
-
-ORF_FILE="${PREFIX}.ORF2LCA.txt"
-
-[[ -s "$CLASS_FILE" ]] || {
-
-    log "ERROR: Missing bin2classification output"
-
-    exit 1
-}
-
-[[ -s "$ORF_FILE" ]] || {
-
-    log "ERROR: Missing ORF2LCA output"
-
-    exit 1
-}
-
-# ============================================================
-# CLEAN TMP FILES
-# ============================================================
-rm -rf "$TMPDIR"
-
-# ============================================================
-# FINAL MESSAGE
-# ============================================================
-log "Finished BAT for sample: $SAMPLE"
+log "BAT prokaryotic MAG taxonomy step completed"
 
 ;;
 
 # ============================================================
-### GTDB-TK (PROK TAXONOMY — PER SAMPLE, ARRAY-AWARE)
+### GTDB-TK (PROK TAXONOMY — PER SAMPLE)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 gtdbtk)
 
@@ -3676,254 +5817,534 @@ shopt -s nullglob
 
 log "Starting GTDB-Tk classification"
 
-THREADS=8
-PPLACER_CPUS=4
+# ============================================================
+# CONFIG
+# ============================================================
+
+THREADS="${THREADS:-8}"
+PPLACER_CPUS="${PPLACER_CPUS:-4}"
+
+# Never allow pplacer to request more CPUs than the job
+if (( PPLACER_CPUS > THREADS )); then
+    PPLACER_CPUS="$THREADS"
+fi
+
 export OMP_NUM_THREADS="$THREADS"
 export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 CLASS_DIR="$OUTPUT_DIR/checkm_classified_prok"
+ASM_CLEAN_DIR="$OUTPUT_DIR/assembly_clean"
 
 GTDB_DIR="$OUTPUT_DIR/gtdbtk"
-
 LOG_DIR="$OUTPUT_DIR/logs/gtdbtk"
+
+# ============================================================
+# QUALITY FILTER
+#
+# Recommended:
+#   HQ + MQ = primary MAG taxonomy
+#
+# Set INCLUDE_LQ=1 if you intentionally want GTDB-Tk
+# classifications for LQ bins as well.
+# ============================================================
+
+INCLUDE_LQ="${INCLUDE_LQ:-0}"
 
 # ============================================================
 # GTDB DATABASE
 # ============================================================
+
 export GTDBTK_DATA_PATH="${GTDBTK_DATA_PATH:-/staging/leuven/stg_00100/Rodgee/databases/gtdbtk/release232}"
-
-log "GTDBTK_DATA_PATH: $GTDBTK_DATA_PATH"
-
-[[ -d "$GTDBTK_DATA_PATH" ]] || {
-    log "ERROR: GTDBTK_DATA_PATH not found"
-    exit 1
-}
 
 mkdir -p "$GTDB_DIR" "$LOG_DIR"
 
+log "THREADS: $THREADS"
+log "PPLACER_CPUS: $PPLACER_CPUS"
+log "GTDBTK_DATA_PATH: $GTDBTK_DATA_PATH"
+log "INCLUDE_LQ: $INCLUDE_LQ"
+
 # ============================================================
-# CHECK GTDB-TK
+# INPUT CHECKS
 # ============================================================
-command -v gtdbtk >/dev/null || {
+
+[[ -d "$CLASS_DIR" ]] || {
+    log "ERROR: CheckM classification directory not found:"
+    log "$CLASS_DIR"
+    exit 1
+}
+
+[[ -f "$CLASS_DIR/CLASSIFICATION_COMPLETE" ]] || {
+    log "ERROR: CheckM classification is not marked complete:"
+    log "$CLASS_DIR/CLASSIFICATION_COMPLETE"
+    exit 1
+}
+
+[[ -d "$ASM_CLEAN_DIR" ]] || {
+    log "ERROR: Clean assembly directory not found:"
+    log "$ASM_CLEAN_DIR"
+    exit 1
+}
+
+[[ -d "$GTDBTK_DATA_PATH" ]] || {
+    log "ERROR: GTDBTK_DATA_PATH not found:"
+    log "$GTDBTK_DATA_PATH"
+    exit 1
+}
+
+# ============================================================
+# TOOL CHECK
+# ============================================================
+
+command -v gtdbtk >/dev/null 2>&1 || {
     log "ERROR: gtdbtk not found"
     exit 1
 }
 
 # ============================================================
-# COLLECT SAMPLES
+# FUNCTION: PROCESS ONE SAMPLE
 # ============================================================
-mapfile -t SAMPLES < <(
 
-    find "$CLASS_DIR"/HQ \
-         "$CLASS_DIR"/MQ \
-         "$CLASS_DIR"/LQ \
-         -maxdepth 1 \
-         -type f \
-         -name "*.fa" \
-         2>/dev/null \
-    | xargs -n 1 basename \
-    | cut -d'_' -f1 \
-    | sort -u
-)
+run_gtdbtk() {
 
-N=${#SAMPLES[@]}
+    local SAMPLE="$1"
 
-log "Total samples detected: $N"
+    local OUTDIR="$GTDB_DIR/$SAMPLE"
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
 
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No samples detected"
-    exit 1
-}
+    # GTDB-Tk classify_wf puts final summary files here
+    local BAC="$OUTDIR/classify/gtdbtk.bac120.summary.tsv"
+    local ARC="$OUTDIR/classify/gtdbtk.ar53.summary.tsv"
 
-# ============================================================
-# ARRAY CHECK
-# ============================================================
-[[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || {
-    log "ERROR: Run as SLURM array job"
-    exit 1
-}
+    local N_MAGS=0
+    local N_REPORTED=0
+    local EXIT_CODE=0
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
 
-    log "No sample assigned to this array index → exiting"
+    # ========================================================
+    # SKIP COMPLETED
+    # ========================================================
 
-    exit 0
-fi
+    if [[ "${FORCE:-0}" != "1" ]]; then
 
-# ============================================================
-# SELECT SAMPLE
-# ============================================================
-SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+        if [[ -f "$OUTDIR/GTDBTK_COMPLETE" ]]; then
+            log "GTDB-Tk already completed -> skipping"
+            return 0
+        fi
 
-OUTDIR="$GTDB_DIR/$SAMPLE"
+        if [[ -f "$OUTDIR/NO_BINS" ]]; then
+            log "No MAGs available for GTDB-Tk -> skipping"
+            return 0
+        fi
 
-TMP_INPUT="$OUTDIR/input"
+        if [[ -f "$OUTDIR/NO_ELIGIBLE_MAGS" ]]; then
+            log "No HQ/MQ MAGs available for GTDB-Tk -> skipping"
+            return 0
+        fi
 
-log "----------------------------------------"
-log "Processing sample: $SAMPLE"
+        # Backward compatibility
+        if [[ -s "$BAC" || -s "$ARC" ]]; then
 
-# ============================================================
-# OUTPUT FILES
-# ============================================================
-BAC="$OUTDIR/classify/gtdbtk.bac120.summary.tsv"
+            log "Existing GTDB-Tk summary detected -> marking complete"
 
-ARC="$OUTDIR/classify/gtdbtk.ar53.summary.tsv"
+            touch "$OUTDIR/GTDBTK_COMPLETE"
 
-# ============================================================
-# SKIP COMPLETED
-# ============================================================
-if [[ (
-        -s "$BAC" || \
-        -s "$ARC"
-      ) && "${FORCE:-0}" != "1" ]]; then
+            return 0
+        fi
 
-    log "GTDB-Tk already completed successfully → skipping"
-
-    exit 0
-fi
-
-# ============================================================
-# CLEAN PARTIAL OUTPUTS
-# ============================================================
-if [[ -d "$OUTDIR" ]]; then
-
-    log "Removing incomplete GTDB-Tk output"
-
-    rm -rf "$OUTDIR"
-fi
-
-mkdir -p "$TMP_INPUT"
-
-# ============================================================
-# COLLECT SAMPLE MAGS
-# ============================================================
-N_MAGS=0
-
-mapfile -t SAMPLE_MAGS < <(
-
-    find "$CLASS_DIR"/HQ \
-         "$CLASS_DIR"/MQ \
-         "$CLASS_DIR"/LQ \
-         -maxdepth 1 \
-         -type f \
-         -name "${SAMPLE}_*.fa" \
-         | sort
-)
-
-for MAG in "${SAMPLE_MAGS[@]}"; do
-
-    [[ -s "$MAG" ]] || continue
-
-    BASE=$(basename "$MAG" .fa)
-
-    # --------------------------------------------------------
-    # DETERMINE QUALITY
-    # --------------------------------------------------------
-    if [[ "$MAG" == *"/HQ/"* ]]; then
-        QUALITY="HQ"
-
-    elif [[ "$MAG" == *"/MQ/"* ]]; then
-        QUALITY="MQ"
-
-    else
-        QUALITY="LQ"
     fi
 
-    NEW_NAME="${BASE}_${QUALITY}.fa"
+    # ========================================================
+    # DETERMINE QUALITY DIRECTORIES
+    # ========================================================
 
-    cp "$MAG" "$TMP_INPUT/$NEW_NAME"
+    local QUALITY_DIRS=(
+        "$CLASS_DIR/HQ"
+        "$CLASS_DIR/MQ"
+    )
 
-    ((++N_MAGS))
-done
+    if [[ "$INCLUDE_LQ" == "1" ]]; then
+        QUALITY_DIRS+=("$CLASS_DIR/LQ")
+    fi
 
-log "MAGs copied for sample: $N_MAGS"
+    # ========================================================
+    # COLLECT SAMPLE MAGs
+    # ========================================================
 
-[[ "$N_MAGS" -gt 0 ]] || {
-    log "ERROR: No MAGs found for sample"
-    exit 1
+    local SAMPLE_MAGS=()
+
+    mapfile -t SAMPLE_MAGS < <(
+        find "${QUALITY_DIRS[@]}" \
+            -maxdepth 1 \
+            -type f \
+            -name "${SAMPLE}_*.fa" \
+            -size +0c \
+            2>/dev/null \
+            | sort -V
+    )
+
+    N_MAGS=${#SAMPLE_MAGS[@]}
+
+    log "Eligible MAGs detected: $N_MAGS"
+
+    # ========================================================
+    # DISTINGUISH TRUE NO-BIN FROM QUALITY FILTER
+    # ========================================================
+
+    if (( N_MAGS == 0 )); then
+
+        local N_ALL=0
+
+        N_ALL=$(find \
+            "$CLASS_DIR/HQ" \
+            "$CLASS_DIR/MQ" \
+            "$CLASS_DIR/LQ" \
+            -maxdepth 1 \
+            -type f \
+            -name "${SAMPLE}_*.fa" \
+            -size +0c \
+            2>/dev/null \
+            | wc -l)
+
+        rm -rf "$OUTDIR"
+        mkdir -p "$OUTDIR"
+
+        if (( N_ALL == 0 )); then
+
+            log "No classified bins exist for $SAMPLE"
+            log "GTDB-Tk not required"
+
+            touch "$OUTDIR/NO_BINS"
+
+        else
+
+            log "Bins exist, but none pass the selected GTDB-Tk quality filter"
+            log "Total classified bins: $N_ALL"
+
+            touch "$OUTDIR/NO_ELIGIBLE_MAGS"
+
+        fi
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+
+        log "Removing previous or incomplete GTDB-Tk output:"
+        log "$OUTDIR"
+
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # SAMPLE-SPECIFIC TEMP AREA
+    #
+    # Keep input FASTAs OUTSIDE the GTDB-Tk output directory.
+    # ========================================================
+
+    local TMP_ROOT="${TMPDIR:-/tmp}"
+
+    local SAMPLE_TMP="$TMP_ROOT/gtdbtk_${SAMPLE}"
+    local INPUT_DIR="$SAMPLE_TMP/input"
+    local GTDB_TMP="$SAMPLE_TMP/tmp"
+
+    rm -rf "$SAMPLE_TMP"
+
+    mkdir -p \
+        "$INPUT_DIR" \
+        "$GTDB_TMP"
+
+    local QUALITY_MAP="$OUTDIR/${SAMPLE}.gtdbtk_input_quality.tsv"
+
+    printf "genome\tquality\tsource_file\n" > "$QUALITY_MAP"
+
+    # ========================================================
+    # PREPARE INPUT MAGs
+    #
+    # Preserve original MAG identifiers.
+    # Do NOT append _HQ/_MQ to the genome identifier.
+    # ========================================================
+
+    log "Preparing GTDB-Tk MAG input"
+
+    for MAG in "${SAMPLE_MAGS[@]}"; do
+
+        [[ -s "$MAG" ]] || continue
+
+        local BASENAME
+        local GENOME
+        local QUALITY
+
+        BASENAME=$(basename "$MAG")
+        GENOME="${BASENAME%.fa}"
+        QUALITY=$(basename "$(dirname "$MAG")")
+
+        if [[ -e "$INPUT_DIR/$BASENAME" ]]; then
+
+            log "ERROR: Duplicate MAG filename:"
+            log "$BASENAME"
+
+            return 1
+        fi
+
+        ln -s "$MAG" "$INPUT_DIR/$BASENAME"
+
+        printf "%s\t%s\t%s\n" \
+            "$GENOME" \
+            "$QUALITY" \
+            "$MAG" \
+            >> "$QUALITY_MAP"
+    done
+
+    # ========================================================
+    # VERIFY INPUT COUNT
+    # ========================================================
+
+    local N_LINKED=0
+
+    N_LINKED=$(find "$INPUT_DIR" \
+        -maxdepth 1 \
+        -type l \
+        -name "*.fa" \
+        | wc -l)
+
+    log "GTDB-Tk input MAGs prepared: $N_LINKED"
+
+    if (( N_LINKED != N_MAGS )); then
+
+        log "ERROR: MAG input count mismatch"
+        log "Expected: $N_MAGS"
+        log "Prepared: $N_LINKED"
+
+        return 1
+    fi
+
+    # ========================================================
+    # RUN GTDB-TK
+    # ========================================================
+
+    log "Running GTDB-Tk classify_wf"
+    log "MAGs: $N_MAGS"
+    log "CPUs: $THREADS"
+    log "pplacer CPUs: $PPLACER_CPUS"
+    log "Temporary directory: $GTDB_TMP"
+
+    set +e
+
+    TMPDIR="$GTDB_TMP" \
+    TEMP="$GTDB_TMP" \
+    TMP="$GTDB_TMP" \
+    gtdbtk classify_wf \
+        --genome_dir "$INPUT_DIR" \
+        --out_dir "$OUTDIR" \
+        --extension fa \
+        --cpus "$THREADS" \
+        --pplacer_cpus "$PPLACER_CPUS" \
+        --tmpdir "$GTDB_TMP" \
+        &>> "$LOGFILE"
+
+    EXIT_CODE=$?
+
+    set -e
+
+    log "GTDB-Tk exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if (( EXIT_CODE != 0 )); then
+
+        log "ERROR: GTDB-Tk failed for $SAMPLE"
+        log "Last 50 lines of GTDB-Tk log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        log "Temporary files retained at:"
+        log "$SAMPLE_TMP"
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE OUTPUT
+    # ========================================================
+
+    if [[ ! -s "$BAC" && ! -s "$ARC" ]]; then
+
+        log "ERROR: Neither bacterial nor archaeal summary was produced"
+        log "Expected one or both of:"
+        log "$BAC"
+        log "$ARC"
+
+        return 1
+    fi
+
+    # ========================================================
+    # COUNT REPORTED GENOMES
+    # ========================================================
+
+    N_REPORTED=0
+
+    if [[ -s "$BAC" ]]; then
+
+        N_BAC=$(awk '
+            NR > 1 {n++}
+            END {print n+0}
+        ' "$BAC")
+
+        log "Bacterial genomes reported: $N_BAC"
+
+        N_REPORTED=$((N_REPORTED + N_BAC))
+    fi
+
+    if [[ -s "$ARC" ]]; then
+
+        N_ARC=$(awk '
+            NR > 1 {n++}
+            END {print n+0}
+        ' "$ARC")
+
+        log "Archaeal genomes reported: $N_ARC"
+
+        N_REPORTED=$((N_REPORTED + N_ARC))
+    fi
+
+    log "Input MAGs: $N_MAGS"
+    log "GTDB-Tk summary records: $N_REPORTED"
+
+    # Do not hard-fail solely on count mismatch because
+    # GTDB-Tk versions may handle failed/filtered genomes
+    # differently. Make it highly visible instead.
+    if (( N_REPORTED != N_MAGS )); then
+
+        log "WARNING: GTDB-Tk output count differs from input MAG count"
+        log "Check:"
+        log "$OUTDIR/identify/gtdbtk.failed_genomes.tsv"
+        log "$LOGFILE"
+    fi
+
+    # ========================================================
+    # MARK COMPLETE
+    # ========================================================
+
+    rm -f \
+        "$OUTDIR/NO_BINS" \
+        "$OUTDIR/NO_ELIGIBLE_MAGS"
+
+    touch "$OUTDIR/GTDBTK_COMPLETE"
+
+    # ========================================================
+    # CLEAN TEMP
+    # ========================================================
+
+    rm -rf "$SAMPLE_TMP"
+
+    # ========================================================
+    # REPORT
+    # ========================================================
+
+    if [[ -s "$BAC" ]]; then
+        log "Bacterial classifications:"
+        log "$BAC"
+    fi
+
+    if [[ -s "$ARC" ]]; then
+        log "Archaeal classifications:"
+        log "$ARC"
+    fi
+
+    log "SUCCESS: GTDB-Tk completed for $SAMPLE"
+
+    return 0
 }
 
 # ============================================================
-# DEBUG
+# SAMPLE SELECTION
 # ============================================================
-log "Files inside TMP_INPUT:"
-ls -lh "$TMP_INPUT"
 
-log "THREADS: $THREADS"
-log "PPLACER_CPUS: $PPLACER_CPUS"
-
-# ============================================================
-# TMPDIR
-# ============================================================
-GTDB_TMP="${TMPDIR:-$OUTDIR/tmp}"
-
-mkdir -p "$GTDB_TMP"
-
-export TMPDIR="$GTDB_TMP"
-
-log "TMPDIR: $TMPDIR"
-
-# ============================================================
-# RUN GTDB-TK
-# ============================================================
-log "Running GTDB-Tk classify_wf"
-
-set +e
-
-gtdbtk classify_wf \
-    --genome_dir "$TMP_INPUT" \
-    --out_dir "$OUTDIR" \
-    --extension fa \
-    --cpus "$THREADS" \
-    --pplacer_cpus "$PPLACER_CPUS" \
-    --tmpdir "$TMPDIR" \
-    &>> "$LOG_DIR/${SAMPLE}.log"
-
-EXIT_CODE=$?
-
-set -e
-
-log "GTDB-Tk exit code: $EXIT_CODE"
-
-# ============================================================
-# HANDLE FAILURE
-# ============================================================
-if [[ "$EXIT_CODE" -ne 0 ]]; then
-
-    log "GTDB-Tk failed — showing last 50 log lines"
-
-    tail -n 50 "$LOG_DIR/${SAMPLE}.log"
-
-    exit 1
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
 fi
 
-# ============================================================
-# VALIDATE OUTPUT
-# ============================================================
-if [[ ! -s "$BAC" && ! -s "$ARC" ]]; then
+if [[ -n "${SAMPLE:-}" ]]; then
 
-    log "ERROR: GTDB-Tk output incomplete"
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
 
-    exit 1
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
+
+    run_gtdbtk "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    #
+    # Stable array based on cleaned assemblies.
+    # This represents all biological samples, including
+    # samples such as S8/S22 that ultimately have no MAGs.
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t ASM_FILES < <(
+        find "$ASM_CLEAN_DIR" \
+            -mindepth 2 \
+            -maxdepth 2 \
+            -type f \
+            -name "*.contigs.clean.fa" \
+            -size +0c \
+            | sort -V
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total samples detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No cleaned assemblies found"
+        exit 1
+    fi
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 ||
+          SLURM_ARRAY_TASK_ID > N )); then
+
+        log "ERROR: Array task ${SLURM_ARRAY_TASK_ID} outside range 1-$N"
+
+        exit 1
+    fi
+
+    ASM="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$ASM" .contigs.clean.fa)
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} / $N -> $SAMPLE"
+
+    run_gtdbtk "$SAMPLE"
+
 fi
 
-# ============================================================
-# REPORT OUTPUTS
-# ============================================================
-if [[ -s "$BAC" ]]; then
-    log "Bacterial classifications detected"
-fi
-
-if [[ -s "$ARC" ]]; then
-    log "Archaeal classifications detected"
-fi
-
-# ============================================================
-# FINAL MESSAGE
-# ============================================================
-log "Finished GTDB-Tk for sample: $SAMPLE"
+log "GTDB-Tk prokaryotic taxonomy step completed"
 
 ;;
 
@@ -3955,7 +6376,7 @@ for FILE in "$GTDB_DIR"/*/classify/*.summary.tsv; do
 
     log "Processing: $SAMPLE"
 
-    awk -v sample="$SAMPLE" '
+    awk -F'\t' -v sample="$SAMPLE" '
     BEGIN {
         OFS="\t"
     }
@@ -4070,12 +6491,13 @@ FNR==1 {
 
     sample=$1
     bin=$2
-    quality=$5
+    # --------------------------------------------------------
+    # MATCH THE CLASSIFIED FASTA ID: SAMPLE_BIN
+    # --------------------------------------------------------
+    key=sample "_" bin
 
-    # --------------------------------------------------------
-    # REBUILD GTDB KEY
-    # --------------------------------------------------------
-    key=sample "_" bin "_" quality
+    # Older GTDB-Tk runs appended the CheckM quality to the FASTA ID.
+    if (!(key in tax)) key=key "_" $5
 
     if (key in tax) {
 
@@ -4095,80 +6517,163 @@ log "Merged file created: $OUT"
 ;;
 
 # ============================================================
-### TIARA SPLIT (PER-SAMPLE, ARRAY-AWARE)
+### TIARA SPLIT (PER-SAMPLE; ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 tiara_split)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting Tiara split step (array mode)"
+log "Starting Tiara split step"
 
 # -------------------- CONFIG --------------------
 THREADS="${THREADS:-8}"
+
 ASM_DIR="$OUTPUT_DIR/assembly"
 TIARA_DIR="$OUTPUT_DIR/tiara"
 
 mkdir -p "$TIARA_DIR"
 
-# -------------------- COLLECT ASSEMBLIES --------------------
-mapfile -t ASM_FILES < <(
-    for d in "$ASM_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        SAMPLE=$(basename "$d")
-        ASM="$d/${SAMPLE}.contigs.fa"
-        [[ -s "$ASM" ]] && echo "$ASM"
-    done | sort
-)
+log "THREADS: $THREADS"
+log "Assembly directory: $ASM_DIR"
+log "Tiara directory: $TIARA_DIR"
 
-N=${#ASM_FILES[@]}
-log "Total samples: $N"
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
 
-[[ "$N" -gt 0 ]] || {
-    log "ERROR: No valid assemblies found"
-    exit 1
-}
+if [[ -n "${SAMPLE:-}" ]]; then
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    CONTIGS="$ASM_DIR/$SAMPLE/${SAMPLE}.contigs.fa"
+
+    [[ -s "$CONTIGS" ]] || {
+        log "ERROR: Assembly not found:"
+        log "$CONTIGS"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    # -------------------- COLLECT ASSEMBLIES --------------------
+    mapfile -t ASM_FILES < <(
+        for d in "$ASM_DIR"/*; do
+
+            [[ -d "$d" ]] || continue
+
+            s=$(basename "$d")
+            f="$d/${s}.contigs.fa"
+
+            [[ -s "$f" ]] && echo "$f"
+
+        done | sort
+    )
+
+    N=${#ASM_FILES[@]}
+
+    log "Total assemblies detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No valid assemblies found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    SAMPLE=$(basename "$CONTIGS" | sed -E 's/\.contigs\.fa$//')
+
 fi
 
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-CONTIGS="${ASM_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$CONTIGS" | sed 's/.contigs.fa//')
+# ============================================================
+# OUTPUT DIRECTORY
+# ============================================================
 
 OUT="$TIARA_DIR/$SAMPLE"
+
 mkdir -p "$OUT"
 
 log "----------------------------------------"
 log "Processing sample: $SAMPLE"
 log "Contigs: $CONTIGS"
+log "Output: $OUT"
 
-# -------------------- CHECK TIARA --------------------
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
+
+# ============================================================
+# CHECK TIARA
+# ============================================================
+
 command -v tiara >/dev/null || {
-    log "ERROR: tiara not found (activate conda in SLURM)"
+    log "ERROR: tiara not found"
+    log "Make sure the Tiara environment is activated in SLURM"
     exit 1
 }
 
 tiara --help >/dev/null 2>&1 || {
-    log "ERROR: tiara not working"
+    log "ERROR: tiara command found but not working"
     exit 1
 }
 
-# -------------------- SKIP --------------------
+# ============================================================
+# SKIP COMPLETED SAMPLE
+# ============================================================
+
 if [[ -s "$OUT/tiara.txt" && "${FORCE:-0}" != "1" ]]; then
-    log "Tiara already done → skipping"
+    log "Tiara already completed -> skipping"
+    log "$OUT/tiara.txt"
     exit 0
 fi
 
-# -------------------- RUN TIARA --------------------
+# ============================================================
+# CLEAN PREVIOUS PARTIAL OUTPUTS
+# ============================================================
+
+if [[ "${FORCE:-0}" == "1" ]]; then
+
+    log "FORCE=1 -> cleaning previous Tiara outputs"
+
+    rm -f \
+        "$OUT/tiara.txt" \
+        "$OUT/euk_ids.txt" \
+        "$OUT/prok_ids.txt" \
+        "$OUT/organelle_ids.txt" \
+        "$OUT/mito_ids.txt" \
+        "$OUT/plastid_ids.txt" \
+        "$OUT/euk.fa" \
+        "$OUT/prok.fa" \
+        "$OUT/organelle.fa" \
+        "$OUT/mito.fa" \
+        "$OUT/plastid.fa"
+
+fi
+
+# ============================================================
+# RUN TIARA
+# ============================================================
+
 log "Running Tiara"
 
 tiara \
@@ -4177,70 +6682,124 @@ tiara \
     -t "$THREADS" \
     --min_len 3000
 
-# -------------------- VALIDATE --------------------
+# ============================================================
+# VALIDATE
+# ============================================================
+
 [[ -s "$OUT/tiara.txt" ]] || {
     log "ERROR: Tiara failed"
     exit 1
 }
 
-# -------------------- SPLIT IDS --------------------
-awk 'NR>1 && $5=="eukarya"{print $1}' "$OUT/tiara.txt" > "$OUT/euk_ids.txt"
+# ============================================================
+# SPLIT CONTIG IDS
+# ============================================================
 
+log "Extracting Tiara classification groups"
+
+# Eukaryotic
+awk 'NR>1 && $5=="eukarya"{print $1}' \
+    "$OUT/tiara.txt" > "$OUT/euk_ids.txt"
+
+# Prokaryotic
 awk 'NR>1 && ($5=="bacteria" || $5=="archaea" || $5=="prokarya"){print $1}' \
     "$OUT/tiara.txt" > "$OUT/prok_ids.txt"
 
-awk 'NR>1 && $5=="organelle"{print $1}' "$OUT/tiara.txt" > "$OUT/organelle_ids.txt"
+# All organelles
+awk 'NR>1 && $5=="organelle"{print $1}' \
+    "$OUT/tiara.txt" > "$OUT/organelle_ids.txt"
 
+# Mitochondria
 awk 'NR>1 && $5=="organelle" && $6=="mitochondrion"{print $1}' \
     "$OUT/tiara.txt" > "$OUT/mito_ids.txt"
 
+# Plastids
 awk 'NR>1 && $5=="organelle" && $6=="plastid"{print $1}' \
     "$OUT/tiara.txt" > "$OUT/plastid_ids.txt"
 
-# -------------------- FASTA SPLIT (ONE-PASS, ROBUST) --------------------
+# ============================================================
+# FASTA SPLIT
+# ============================================================
+
 log "Splitting FASTA (single-pass)"
 
-awk -v euk="$OUT/euk_ids.txt" \
-    -v prok="$OUT/prok_ids.txt" \
-    -v org="$OUT/organelle_ids.txt" \
-    -v mito="$OUT/mito_ids.txt" \
-    -v plast="$OUT/plastid_ids.txt" \
-    -v euk_out="$OUT/euk.fa" \
-    -v prok_out="$OUT/prok.fa" \
-    -v org_out="$OUT/organelle.fa" \
-    -v mito_out="$OUT/mito.fa" \
-    -v plast_out="$OUT/plastid.fa" \
+# Remove previous split FASTAs first.
+# Important if a failed/partial run is being repeated.
+rm -f \
+    "$OUT/euk.fa" \
+    "$OUT/prok.fa" \
+    "$OUT/organelle.fa" \
+    "$OUT/mito.fa" \
+    "$OUT/plastid.fa"
+
+awk \
+-v euk="$OUT/euk_ids.txt" \
+-v prok="$OUT/prok_ids.txt" \
+-v org="$OUT/organelle_ids.txt" \
+-v mito="$OUT/mito_ids.txt" \
+-v plast="$OUT/plastid_ids.txt" \
+-v euk_out="$OUT/euk.fa" \
+-v prok_out="$OUT/prok.fa" \
+-v org_out="$OUT/organelle.fa" \
+-v mito_out="$OUT/mito.fa" \
+-v plast_out="$OUT/plastid.fa" \
 '
 BEGIN {
-    while ((getline < euk)   > 0) euk_ids[$1]=1
-    while ((getline < prok)  > 0) prok_ids[$1]=1
-    while ((getline < org)   > 0) org_ids[$1]=1
-    while ((getline < mito)  > 0) mito_ids[$1]=1
-    while ((getline < plast) > 0) plast_ids[$1]=1
 
-    close(euk); close(prok); close(org); close(mito); close(plast)
+    while ((getline < euk) > 0)
+        euk_ids[$1]=1
+
+    while ((getline < prok) > 0)
+        prok_ids[$1]=1
+
+    while ((getline < org) > 0)
+        org_ids[$1]=1
+
+    while ((getline < mito) > 0)
+        mito_ids[$1]=1
+
+    while ((getline < plast) > 0)
+        plast_ids[$1]=1
+
+    close(euk)
+    close(prok)
+    close(org)
+    close(mito)
+    close(plast)
 }
 
 /^>/ {
-    split(substr($0,2), a, " ")
-    header = a[1]
 
-    is_euk  = (header in euk_ids)
-    is_prok = (header in prok_ids)
-    is_org  = (header in org_ids)
-    is_mito = (header in mito_ids)
-    is_plast= (header in plast_ids)
+    split(substr($0,2), a, " ")
+
+    header=a[1]
+
+    is_euk   = (header in euk_ids)
+    is_prok  = (header in prok_ids)
+    is_org   = (header in org_ids)
+    is_mito  = (header in mito_ids)
+    is_plast = (header in plast_ids)
 }
 
 {
-    if (is_euk)  print >> euk_out
-    if (is_prok) print >> prok_out
-    if (is_org)  print >> org_out
-    if (is_mito) print >> mito_out
-    if (is_plast)print >> plast_out
+    if (is_euk)
+        print >> euk_out
+
+    if (is_prok)
+        print >> prok_out
+
+    if (is_org)
+        print >> org_out
+
+    if (is_mito)
+        print >> mito_out
+
+    if (is_plast)
+        print >> plast_out
 }
 
 END {
+
     close(euk_out)
     close(prok_out)
     close(org_out)
@@ -4249,13 +6808,28 @@ END {
 }
 ' "$CONTIGS"
 
-# -------------------- EMPTY FILE SAFETY --------------------
-for f in euk.fa prok.fa organelle.fa mito.fa plastid.fa; do
+# ============================================================
+# EMPTY FILE SAFETY
+# ============================================================
+
+for f in \
+    euk.fa \
+    prok.fa \
+    organelle.fa \
+    mito.fa \
+    plastid.fa
+do
+
     [[ -s "$OUT/$f" ]] || : > "$OUT/$f"
+
 done
 
-# -------------------- SUMMARY --------------------
+# ============================================================
+# SUMMARY
+# ============================================================
+
 log "Summary for $SAMPLE:"
+
 log "  euk:       $(wc -l < "$OUT/euk_ids.txt")"
 log "  prok:      $(wc -l < "$OUT/prok_ids.txt")"
 log "  organelle: $(wc -l < "$OUT/organelle_ids.txt")"
@@ -4263,257 +6837,18 @@ log "  mito:      $(wc -l < "$OUT/mito_ids.txt")"
 log "  plastid:   $(wc -l < "$OUT/plastid_ids.txt")"
 
 log "Finished Tiara split for $SAMPLE"
-;;
-
-# ============================================================
-### CAT (CONTIG-LEVEL — TIARA PROKARYOTIC CONTIGS)
-# ============================================================
-cat_contigs_prok)
-
-set -euo pipefail
-shopt -s nullglob
-
-log "Starting CAT (contig-level, prok)"
-
-THREADS="${THREADS:-8}"
-
-TARGET_SAMPLE="${TARGET_SAMPLE:-}"
-
-TIARA_DIR="$OUTPUT_DIR/tiara"
-
-CAT_DIR="$OUTPUT_DIR/cat_contigs_prok"
-
-LOG_DIR="$OUTPUT_DIR/logs/cat_contigs_prok"
-
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
-
-CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
-
-CAT_CMD="${CAT_CMD:-CAT_pack}"
-
-mkdir -p "$CAT_DIR" "$LOG_DIR"
-
-# ============================================================
-# DEPENDENCY CHECK
-# ============================================================
-command -v "$CAT_CMD" >/dev/null || {
-    log "ERROR: CAT_pack not found"
-    exit 1
-}
-
-command -v diamond >/dev/null || {
-    log "ERROR: DIAMOND not found"
-    exit 1
-}
-
-# ============================================================
-# FUNCTION TO PROCESS ONE SAMPLE
-# ============================================================
-run_cat() {
-
-    local SAMPLE="$1"
-
-    local SAMPLE_DIR="$TIARA_DIR/$SAMPLE"
-
-    local CONTIGS="$SAMPLE_DIR/prok.fa"
-
-    local OUTDIR="$CAT_DIR/$SAMPLE"
-
-    local PREFIX="$OUTDIR/${SAMPLE}"
-
-    log "----------------------------------------"
-    log "Processing sample: $SAMPLE"
-
-    # --------------------------------------------------------
-    # CHECK INPUT
-    # --------------------------------------------------------
-    [[ -s "$CONTIGS" ]] || {
-
-        log "No prok.fa found → skipping"
-
-        return
-    }
-
-    # --------------------------------------------------------
-    # SKIP COMPLETED
-    # --------------------------------------------------------
-    if [[ -s "${PREFIX}.contigs2classification.txt" &&
-          "${FORCE:-0}" != "1" ]]; then
-
-        log "CAT already completed → skipping"
-
-        return
-    fi
-
-    # --------------------------------------------------------
-    # CLEAN PARTIAL OUTPUTS
-    # --------------------------------------------------------
-    rm -rf "$OUTDIR"
-
-    mkdir -p "$OUTDIR"
-
-    # --------------------------------------------------------
-    # DEBUG
-    # --------------------------------------------------------
-    log "Input prokaryotic contigs:"
-    log "$CONTIGS"
-
-    log "Output prefix:"
-    log "$PREFIX"
-
-    log "Threads: $THREADS"
-
-    # --------------------------------------------------------
-    # RUN CAT
-    # --------------------------------------------------------
-    log "Running CAT_pack contigs"
-
-    set +e
-
-    "$CAT_CMD" contigs \
-        -c "$CONTIGS" \
-        -d "$CAT_DB" \
-        -t "$CAT_TAX" \
-        -o "$PREFIX" \
-        --nproc "$THREADS" \
-        --block_size 2 \
-        2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-    EXIT_CODE=${PIPESTATUS[0]}
-
-    set -e
-
-    log "CAT exit code: $EXIT_CODE"
-
-    # --------------------------------------------------------
-    # HANDLE FAILURE
-    # --------------------------------------------------------
-    if [[ "$EXIT_CODE" -ne 0 ]]; then
-
-        log "ERROR: CAT failed for $SAMPLE"
-
-        tail -n 50 "$LOG_DIR/${SAMPLE}.log"
-
-        return
-    fi
-
-    # --------------------------------------------------------
-    # VALIDATE OUTPUT
-    # --------------------------------------------------------
-    [[ -s "${PREFIX}.contigs2classification.txt" ]] || {
-
-        log "ERROR: Missing contigs2classification output"
-
-        return
-    }
-
-    log "Finished CAT for sample: $SAMPLE"
-}
-
-# ============================================================
-# MODE SELECTION
-# ============================================================
-
-# ------------------------------------------------------------
-# MANUAL MODE
-# ------------------------------------------------------------
-if [[ -n "$TARGET_SAMPLE" ]]; then
-
-    log "Manual mode → $TARGET_SAMPLE"
-
-    run_cat "$TARGET_SAMPLE"
-
-# ------------------------------------------------------------
-# ARRAY MODE
-# ------------------------------------------------------------
-elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-
-    mapfile -t SAMPLES < <(
-
-        for d in "$TIARA_DIR"/*; do
-
-            [[ -d "$d" ]] || continue
-
-            SAMPLE=$(basename "$d")
-
-            CONTIGS="$d/prok.fa"
-
-            [[ -s "$CONTIGS" ]] || continue
-
-            PREFIX="$CAT_DIR/$SAMPLE/${SAMPLE}"
-
-            # only incomplete samples
-            [[ ! -s "${PREFIX}.contigs2classification.txt" ]] || continue
-
-            echo "$SAMPLE"
-
-        done | sort
-    )
-
-    N=${#SAMPLES[@]}
-
-    log "Incomplete samples detected: $N"
-
-    [[ "$N" -gt 0 ]] || {
-
-        log "Nothing left to process"
-
-        exit 0
-    }
-
-    if (( SLURM_ARRAY_TASK_ID > N )); then
-
-        log "No sample assigned to this array index"
-
-        exit 0
-    fi
-
-    SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-
-    run_cat "$SAMPLE"
-
-# ------------------------------------------------------------
-# AUTO MODE
-# ------------------------------------------------------------
-else
-
-    log "Auto mode → running only incomplete samples"
-
-    for d in "$TIARA_DIR"/*; do
-
-        [[ -d "$d" ]] || continue
-
-        SAMPLE=$(basename "$d")
-
-        CONTIGS="$d/prok.fa"
-
-        PREFIX="$CAT_DIR/$SAMPLE/${SAMPLE}"
-
-        if [[ -s "$CONTIGS" &&
-              ! -s "${PREFIX}.contigs2classification.txt" ]]; then
-
-            run_cat "$SAMPLE"
-
-        else
-
-            log "Skipping $SAMPLE (done or missing prok.fa)"
-        fi
-    done
-fi
-
-log "CAT prok contig step completed"
 
 ;;
 
 # ============================================================
-### REMAG (EUK BINNING — PER-SAMPLE, ARRAY-AWARE)
+### REMAG (EUK BINNING — PER-SAMPLE; ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 remag)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting reMAG step (array mode)"
+log "Starting reMAG step"
 
 # -------------------- CONFIG --------------------
 THREADS="${THREADS:-8}"
@@ -4525,111 +6860,290 @@ LOG_DIR="$OUTPUT_DIR/logs/remag"
 
 mkdir -p "$REMAG_DIR" "$LOG_DIR"
 
-# -------------------- CHECK INPUT DIRS --------------------
-[[ -d "$TIARA_DIR" ]] || { log "ERROR: Missing TIARA dir: $TIARA_DIR"; exit 1; }
-[[ -d "$MAP_DIR"   ]] || { log "ERROR: Missing mapping dir: $MAP_DIR"; exit 1; }
+log "THREADS: $THREADS"
+log "TIARA_DIR: $TIARA_DIR"
+log "MAP_DIR: $MAP_DIR"
+log "REMAG_DIR: $REMAG_DIR"
 
-# -------------------- TOOL CHECK --------------------
-if ! command -v remag >/dev/null 2>&1; then
-    log "ERROR: remag not found (activate conda in SLURM job)"
+# ============================================================
+# CHECK INPUT DIRECTORIES
+# ============================================================
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Missing TIARA directory:"
+    log "$TIARA_DIR"
     exit 1
+}
+
+[[ -d "$MAP_DIR" ]] || {
+    log "ERROR: Missing mapping directory:"
+    log "$MAP_DIR"
+    exit 1
+}
+
+# ============================================================
+# TOOL CHECK
+# ============================================================
+
+command -v remag >/dev/null 2>&1 || {
+    log "ERROR: remag not found"
+    log "Make sure the reMAG conda environment is activated in SLURM"
+    exit 1
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    log "Running in single-sample mode"
+
+    COND="$TIARA_DIR/$SAMPLE"
+
+    [[ -d "$COND" ]] || {
+        log "ERROR: Tiara directory not found:"
+        log "$COND"
+        exit 1
+    }
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+    log "Running in array mode"
+
+    mapfile -t TIARA_SAMPLES < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#TIARA_SAMPLES[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+    COND="${TIARA_SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$COND")
+
 fi
 
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t TIARA_SAMPLES < <(
-    for d in "$TIARA_DIR"/*; do
-        [[ -d "$d" ]] && echo "$d"
-    done | sort
-)
-
-N=${#TIARA_SAMPLES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No Tiara samples found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-COND="${TIARA_SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$COND")
+# ============================================================
+# SAMPLE FILES
+# ============================================================
 
 EUK_FASTA="$COND/euk.fa"
 BAM="$MAP_DIR/${SAMPLE}.bam"
+
 OUTDIR="$REMAG_DIR/$SAMPLE"
 
 log "----------------------------------------"
 log "Processing sample: $SAMPLE"
 log "EUK_FASTA: $EUK_FASTA"
 log "BAM: $BAM"
+log "OUTDIR: $OUTDIR"
 
-# -------------------- INPUT VALIDATION --------------------
+if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID}"
+fi
+
+# ============================================================
+# INPUT VALIDATION
+# ============================================================
+
 if [[ ! -s "$EUK_FASTA" ]]; then
-    log "WARNING: No eukaryotic contigs → skipping"
-    exit 0
+    log "WARNING: Missing or empty euk.fa -> skipping"
+    continue
 fi
 
 if [[ ! -s "$BAM" ]]; then
-    log "WARNING: Missing BAM → skipping"
-    exit 0
+    log "WARNING: Missing or empty BAM -> skipping"
+    continue
 fi
 
-# -------------------- SKIP --------------------
+# ============================================================
+# SKIP IF DONE
+# ============================================================
+
 if [[ -s "$OUTDIR/bins.csv" && "${FORCE:-0}" != "1" ]]; then
-    log "reMAG already done → skipping"
-    exit 0
+    log "reMAG already completed -> skipping"
+    log "$OUTDIR/bins.csv"
+    continue
 fi
 
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
+# ============================================================
+# CLEAN OLD / PARTIAL RUN
+# ============================================================
+
+if [[ -d "$OUTDIR" ]]; then
+    log "Removing previous reMAG directory:"
+    log "$OUTDIR"
+    rm -rf "$OUTDIR"
+fi
+
 mkdir -p "$OUTDIR"
 
-# -------------------- RUN REMAG --------------------
+# ============================================================
+# RUN REMAG
+# ============================================================
+
 log "Running reMAG"
+
+REMAG_LOG="$LOG_DIR/${SAMPLE}.log"
+
+REMAG_EXIT=0
 
 remag \
     "$EUK_FASTA" \
     -c "$BAM" \
     -o "$OUTDIR" \
     --skip-bacterial-filter \
-    &>> "$LOG_DIR/${SAMPLE}.log"
+    &>> "$REMAG_LOG" || REMAG_EXIT=$?
 
-# -------------------- VALIDATE --------------------
-if [[ ! -s "$OUTDIR/bins.csv" ]]; then
-    log "WARNING: No bins produced for $SAMPLE"
-    exit 0
+log "reMAG exit code: $REMAG_EXIT"
+
+# ============================================================
+# CHECK REMAG RESULT
+# ============================================================
+
+# ------------------------------------------------------------
+# CASE 1: reMAG produced bins.csv
+# ------------------------------------------------------------
+
+if [[ -s "$OUTDIR/bins.csv" ]]; then
+
+    if [[ -d "$OUTDIR/bins" ]]; then
+
+        NBINS=$(find "$OUTDIR/bins" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.fa" \
+            | wc -l)
+
+    else
+        NBINS=0
+    fi
+
+    if (( NBINS > 0 )); then
+
+        log "reMAG completed successfully"
+        log "Number of bins: $NBINS"
+
+        touch "$OUTDIR/REMAG_COMPLETE"
+
+    else
+
+        log "reMAG completed but produced no bins"
+        log "This is treated as a valid no-bin result"
+
+        touch "$OUTDIR/NO_BINS"
+
+    fi
+
+    continue
 fi
 
-# -------------------- SUMMARY --------------------
+# ------------------------------------------------------------
+# CASE 2: exit code 0 but no bins.csv
+# ------------------------------------------------------------
+
+if (( REMAG_EXIT == 0 )); then
+
+    log "reMAG completed without producing bins.csv"
+    log "No bins were recovered for $SAMPLE"
+
+    touch "$OUTDIR/NO_BINS"
+
+    continue
+fi
+
+# ------------------------------------------------------------
+# CASE 3: genuine reMAG failure
+# ------------------------------------------------------------
+
+log "ERROR: reMAG failed for $SAMPLE"
+log "Exit code: $REMAG_EXIT"
+log "Check log:"
+log "$REMAG_LOG"
+
+log "Last 50 lines of reMAG log:"
+tail -n 50 "$REMAG_LOG" || true
+
+exit "$REMAG_EXIT"
+
+# ============================================================
+# VALIDATE
+# ============================================================
+
+if [[ ! -s "$OUTDIR/bins.csv" ]]; then
+    log "WARNING: reMAG finished but no bins.csv was produced"
+    log "Sample: $SAMPLE"
+    log "Check log:"
+    log "$LOG_DIR/${SAMPLE}.log"
+    continue
+fi
+
+# ============================================================
+# SUMMARY
+# ============================================================
+
 log "Finished reMAG for $SAMPLE"
 
 if [[ -d "$OUTDIR/bins" ]]; then
-    log "Number of bins: $(ls "$OUTDIR/bins"/*.fa 2>/dev/null | wc -l)"
+
+    NBINS=$(find "$OUTDIR/bins" \
+        -maxdepth 1 \
+        -type f \
+        -name "*.fa" \
+        | wc -l)
+
+    log "Number of bins: $NBINS"
+
 else
+
     log "WARNING: No bins directory created"
+
 fi
+
+log "reMAG completed for sample: $SAMPLE"
 
 ;;
 
 # ============================================================
-### BUSCO (EUK QUALITY — PER-BIN, ARRAY-AWARE)
+### BUSCO (EUK QUALITY — PER-BIN; ARRAY OR SINGLE-SAMPLE)
 # ============================================================
 busco)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting BUSCO step (array mode)"
+log "Starting BUSCO step"
 
 THREADS="${THREADS:-8}"
+MIN_SIZE="${BUSCO_MIN_SIZE:-50000}"
 
 REMAG_DIR="$OUTPUT_DIR/remag"
 BUSCO_DIR="$OUTPUT_DIR/busco"
@@ -4637,83 +7151,249 @@ LOG_DIR="$OUTPUT_DIR/logs/busco"
 
 mkdir -p "$BUSCO_DIR" "$LOG_DIR"
 
-# -------------------- COLLECT ALL BINS --------------------
-mapfile -t BIN_FILES < <(
-    for f in "$REMAG_DIR"/*/bins/*.fa; do
-        [[ -s "$f" ]] && echo "$f"
-    done | sort
-)
+log "THREADS: $THREADS"
+log "REMAG_DIR: $REMAG_DIR"
+log "BUSCO_DIR: $BUSCO_DIR"
+log "Minimum bin size: ${MIN_SIZE} bp"
 
-N=${#BIN_FILES[@]}
+# ============================================================
+# TOOL CHECK
+# ============================================================
 
-log "Total bins detected: $N"
-
-if [[ "$N" -eq 0 ]]; then
-    log "ERROR: No bins found"
+command -v busco >/dev/null 2>&1 || {
+    log "ERROR: BUSCO not found"
+    log "Make sure the BUSCO environment/module is loaded"
     exit 1
+}
+
+# ============================================================
+# FUNCTION: RUN BUSCO FOR ONE BIN
+# ============================================================
+
+run_busco() {
+
+    local BIN="$1"
+
+    local SAMPLE
+    local BIN_NAME
+    local OUT_PREFIX
+    local OUTDIR
+    local SIZE
+
+    SAMPLE=$(basename "$(dirname "$(dirname "$BIN")")")
+    BIN_NAME=$(basename "$BIN" .fa)
+
+    OUT_PREFIX="${SAMPLE}_${BIN_NAME}"
+    OUTDIR="$BUSCO_DIR/$OUT_PREFIX"
+
+    log "----------------------------------------"
+    log "Sample: $SAMPLE"
+    log "Bin: $BIN_NAME"
+    log "Input: $BIN"
+    log "Output: $OUTDIR"
+
+    # --------------------------------------------------------
+    # INPUT CHECK
+    # --------------------------------------------------------
+
+    [[ -s "$BIN" ]] || {
+        log "WARNING: Bin missing or empty -> skipping"
+        return 0
+    }
+
+    # --------------------------------------------------------
+    # CALCULATE TRUE FASTA SEQUENCE LENGTH
+    # --------------------------------------------------------
+    # This counts nucleotide sequence length rather than
+    # filesystem byte size.
+
+    SIZE=$(awk '
+        !/^>/ {
+            gsub(/[[:space:]]/, "")
+            n += length($0)
+        }
+        END {
+            print n+0
+        }
+    ' "$BIN")
+
+    log "Bin sequence length: ${SIZE} bp"
+
+    # --------------------------------------------------------
+    # FILTER SMALL BINS
+    # --------------------------------------------------------
+
+    if (( SIZE < MIN_SIZE )); then
+        log "Bin smaller than ${MIN_SIZE} bp -> skipping BUSCO"
+        return 0
+    fi
+
+    # --------------------------------------------------------
+    # SKIP COMPLETED
+    # --------------------------------------------------------
+
+    if compgen -G "$OUTDIR/short_summary.*.txt" > /dev/null \
+       && [[ "${FORCE:-0}" != "1" ]]; then
+
+        log "BUSCO already completed -> skipping"
+        return 0
+
+    fi
+
+    # --------------------------------------------------------
+    # CLEAN OLD / PARTIAL RUN
+    # --------------------------------------------------------
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous BUSCO directory:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    # --------------------------------------------------------
+    # RUN BUSCO
+    # --------------------------------------------------------
+
+    log "Running BUSCO"
+
+    busco \
+        -i "$BIN" \
+        -l eukaryota_odb10 \
+        -o "$OUT_PREFIX" \
+        -m genome \
+        -c "$THREADS" \
+        --out_path "$BUSCO_DIR" \
+        &>> "$LOG_DIR/${OUT_PREFIX}.log"
+
+    # --------------------------------------------------------
+    # VALIDATE
+    # --------------------------------------------------------
+
+    if ! compgen -G "$OUTDIR/short_summary.*.txt" > /dev/null; then
+
+        log "ERROR: BUSCO failed for:"
+        log "$OUT_PREFIX"
+        log "Check:"
+        log "$LOG_DIR/${OUT_PREFIX}.log"
+
+        return 1
+    fi
+
+    log "BUSCO completed: $OUT_PREFIX"
+}
+
+
+# ============================================================
+# SAMPLE / BIN SELECTION
+# ============================================================
+
+if [[ -n "${BIN_FILE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-BIN MODE
+    # --------------------------------------------------------
+
+    log "Running in single-bin mode"
+
+    [[ -s "$BIN_FILE" ]] || {
+        log "ERROR: BIN_FILE not found or empty:"
+        log "$BIN_FILE"
+        exit 1
+    }
+
+    run_busco "$BIN_FILE"
+
+
+elif [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+    # Run all reMAG bins belonging to this sample.
+
+    log "Running in single-sample mode: $SAMPLE"
+
+    SAMPLE_BIN_DIR="$REMAG_DIR/$SAMPLE/bins"
+
+    [[ -d "$SAMPLE_BIN_DIR" ]] || {
+        log "WARNING: No bins directory for $SAMPLE"
+        log "$SAMPLE_BIN_DIR"
+        exit 0
+    }
+
+    mapfile -t BIN_FILES < <(
+        find "$SAMPLE_BIN_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#BIN_FILES[@]}
+
+    log "Bins detected for $SAMPLE: $N"
+
+    if [[ "$N" -eq 0 ]]; then
+        log "No bins found for $SAMPLE -> nothing to run"
+        exit 0
+    fi
+
+    for BIN in "${BIN_FILES[@]}"; do
+        run_busco "$BIN"
+    done
+
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t BIN_FILES < <(
+        find "$REMAG_DIR" \
+            -mindepth 3 \
+            -maxdepth 3 \
+            -type f \
+            -path "*/bins/*.fa" \
+            -size +0c \
+            | sort
+    )
+
+    N=${#BIN_FILES[@]}
+
+    log "Total bins detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No reMAG bins found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job, export SAMPLE=<sample>, or set BIN_FILE=<file>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT BIN --------------------
+
+    BIN="${BIN_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
+
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
+
+    run_busco "$BIN"
+
 fi
 
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-    log "ERROR: Task ID out of range (1–$N)"
-    exit 1
-fi
-
-# -------------------- SELECT BIN --------------------
-BIN="${BIN_FILES[$((SLURM_ARRAY_TASK_ID-1))]}"
-
-SAMPLE=$(basename "$(dirname "$(dirname "$BIN")")")
-BIN_NAME=$(basename "$BIN" .fa)
-
-OUT_PREFIX="${SAMPLE}_${BIN_NAME}"
-OUTDIR="$BUSCO_DIR/$OUT_PREFIX"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE / $BIN_NAME"
-log "BIN: $BIN"
-
-# -------------------- FILTER SMALL BINS --------------------
-SIZE=$(wc -c < "$BIN")
-MIN_SIZE=50000  # 50 kb threshold (adjust if needed)
-
-if (( SIZE < MIN_SIZE )); then
-    log "WARNING: Bin too small (${SIZE} bp) → skipping BUSCO"
-    exit 0
-fi
-
-# -------------------- SKIP --------------------
-if compgen -G "$OUTDIR/short_summary.*.txt" > /dev/null && [[ "${FORCE:-0}" != "1" ]]; then
-    log "BUSCO already done → skipping"
-    exit 0
-fi
-
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
-
-# -------------------- RUN BUSCO --------------------
-log "Running BUSCO"
-
-busco \
-    -i "$BIN" \
-    -l eukaryota_odb10 \
-    -o "$OUT_PREFIX" \
-    -m genome \
-    -c "$THREADS" \
-    --out_path "$BUSCO_DIR" \
-    &>> "$LOG_DIR/${OUT_PREFIX}.log"
-
-# -------------------- VALIDATE --------------------
-if ! compgen -G "$OUTDIR/short_summary.*.txt" > /dev/null; then
-    log "ERROR: BUSCO failed for $OUT_PREFIX"
-    exit 1
-fi
-
-log "Finished BUSCO: $OUT_PREFIX"
+log "BUSCO step completed"
 
 ;;
 
@@ -4921,9 +7601,907 @@ log "Created: $OUT"
 
 ;;
 
+
 # ============================================================
-### RAT (READ-LEVEL — TIARA EUK CONTIGS + EXISTING CAT OUTPUTS)
-### RUN NEW SAMPLES + RERUN FAILED ONLY
+### CAT (CONTIG-LEVEL — TIARA EUKARYOTIC CONTIGS)
+### ARRAY OR SINGLE-SAMPLE
+# ============================================================
+cat_contigs)
+
+set -euo pipefail
+shopt -s nullglob
+
+log "Starting CAT (contig-level, eukaryotic contigs)"
+
+# -------------------- CONFIG --------------------
+THREADS="${THREADS:-16}"
+
+TIARA_DIR="$OUTPUT_DIR/tiara"
+CAT_DIR="$OUTPUT_DIR/cat_contigs"
+LOG_DIR="$OUTPUT_DIR/logs/cat_contigs"
+
+CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
+CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
+CAT_CMD="${CAT_CMD:-CAT_pack}"
+
+mkdir -p "$CAT_DIR" "$LOG_DIR"
+
+log "THREADS: $THREADS"
+log "TIARA_DIR: $TIARA_DIR"
+log "CAT_DIR: $CAT_DIR"
+
+# ============================================================
+# INPUT DIRECTORY CHECK
+# ============================================================
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Tiara directory not found:"
+    log "$TIARA_DIR"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
+    log "ERROR: CAT_pack not found"
+    exit 1
+}
+
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
+    exit 1
+}
+
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
+
+run_cat() {
+
+    local SAMPLE="$1"
+
+    local SAMPLE_DIR="$TIARA_DIR/$SAMPLE"
+    local CONTIGS="$SAMPLE_DIR/euk.fa"
+
+    local OUTDIR="$CAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local EXIT_CODE
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Eukaryotic contigs: $CONTIGS"
+    log "Output prefix: $PREFIX"
+
+    # ========================================================
+    # INPUT CHECK
+    # ========================================================
+
+    if [[ ! -d "$SAMPLE_DIR" ]]; then
+        log "ERROR: Tiara sample directory not found:"
+        log "$SAMPLE_DIR"
+        return 1
+    fi
+
+    # Empty euk.fa can be a legitimate Tiara result
+    if [[ ! -e "$CONTIGS" ]]; then
+        log "ERROR: euk.fa does not exist:"
+        log "$CONTIGS"
+        return 1
+    fi
+
+    if [[ ! -s "$CONTIGS" ]]; then
+        log "No eukaryotic contigs for $SAMPLE -> skipping CAT"
+        return 0
+    fi
+
+    # ========================================================
+    # SKIP IF DONE
+    # ========================================================
+
+    if [[ -s "${PREFIX}.contig2classification.txt" &&
+          "${FORCE:-0}" != "1" ]]; then
+
+        log "CAT already completed -> skipping"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous CAT directory:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # RUN CAT
+    # ========================================================
+
+    log "Running CAT_pack contigs"
+
+    set +e
+
+    "$CAT_CMD" contigs \
+        -c "$CONTIGS" \
+        -d "$CAT_DB" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --nproc "$THREADS" \
+        --block_size 2 \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "CAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: CAT failed for $SAMPLE"
+        log "Last lines of CAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return 1
+    fi
+
+    # ========================================================
+    # VALIDATE
+    # ========================================================
+
+    if [[ ! -s "${PREFIX}.contig2classification.txt" ]]; then
+
+        log "ERROR: CAT completed but classification file is missing:"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 1
+    fi
+
+    log "Finished CAT for sample: $SAMPLE"
+    log "Classification:"
+    log "${PREFIX}.contig2classification.txt"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility:
+# if TARGET_SAMPLE is provided but SAMPLE is not, use it.
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_cat "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
+
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
+
+    run_cat "$SAMPLE"
+
+fi
+
+log "CAT eukaryotic contig step completed"
+
+;;
+
+# ============================================================
+### CONTIG LENGTH EXTRACTION (TIARA EUK CONTIGS)
+# ============================================================
+contig_lengths)
+
+set -euo pipefail
+shopt -s nullglob
+
+log() { echo "[$(date '+%F %T')] $*"; }
+
+log "Starting contig length extraction"
+
+THREADS="${THREADS:-4}"
+TARGET_SAMPLE="${TARGET_SAMPLE:-}"
+FORCE="${FORCE:-0}"
+
+TIARA_DIR="$OUTPUT_DIR/tiara"
+LEN_DIR="$OUTPUT_DIR/contig_lengths"
+LOG_DIR="$OUTPUT_DIR/logs/contig_lengths"
+
+mkdir -p "$LEN_DIR" "$LOG_DIR"
+
+# ============================================================
+# LOAD CONDA ENVIRONMENT (SEQKIT)
+# ============================================================
+
+log "Loading conda environment (seqkit)"
+
+# Initialize conda (important on HPC)
+source /staging/leuven/stg_00100/Rodgee/miniforge3/etc/profile.d/conda.sh
+
+# Activate environment
+conda activate seqkit_env
+
+# Check
+command -v seqkit >/dev/null || { log "ERROR: seqkit not found in conda env"; exit 1; }
+
+log "Using seqkit: $(which seqkit)"
+
+# -------------------- DEPENDENCY CHECK --------------------
+command -v seqkit >/dev/null || { log "ERROR: seqkit not found"; exit 1; }
+
+# ============================================================
+# FUNCTION TO PROCESS ONE SAMPLE
+# ============================================================
+run_lengths() {
+
+    local SAMPLE="$1"
+    local COND="$TIARA_DIR/$SAMPLE"
+
+    CONTIGS="$COND/euk.fa"
+    OUT="$LEN_DIR/${SAMPLE}_lengths.tsv"
+
+    log "----------------------------------------"
+    log "Processing: $SAMPLE"
+
+    [[ -s "$CONTIGS" ]] || {
+        log "No euk.fa → skip"
+        return
+    }
+
+    # -------------------- SKIP IF DONE --------------------
+    if [[ -s "$OUT" && "$FORCE" != "1" ]]; then
+        log "Already done → skipping"
+        return
+    fi
+
+    # -------------------- EXTRACT LENGTHS --------------------
+    log "Extracting contig lengths"
+
+    (
+        echo -e "contig\tlength"
+        seqkit fx2tab -n -l "$CONTIGS"
+    ) > "$OUT.tmp"
+
+    # -------------------- SAFE WRITE --------------------
+    if [[ -s "$OUT.tmp" ]]; then
+        mv "$OUT.tmp" "$OUT"
+        log "Created: $OUT"
+    else
+        log "ERROR: Failed to generate length file"
+        rm -f "$OUT.tmp"
+        exit 1
+    fi
+}
+
+# ============================================================
+# MODE SELECTION
+# ============================================================
+
+# -------------------- MANUAL MODE --------------------
+if [[ -n "$TARGET_SAMPLE" ]]; then
+    log "Manual mode → $TARGET_SAMPLE"
+    run_lengths "$TARGET_SAMPLE"
+
+# -------------------- ARRAY MODE --------------------
+elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+
+    mapfile -t SAMPLES < <(
+        for d in "$TIARA_DIR"/*; do
+            [[ -d "$d" ]] || continue
+            [[ -s "$d/euk.fa" ]] && basename "$d"
+        done | sort
+    )
+
+    N=${#SAMPLES[@]}
+
+    if (( SLURM_ARRAY_TASK_ID > N )); then
+        log "No sample → exiting"
+        exit 0
+    fi
+
+    SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+    run_lengths "$SAMPLE"
+
+# -------------------- AUTO MODE --------------------
+else
+    log "Auto mode → processing all samples"
+
+    for d in "$TIARA_DIR"/*; do
+        [[ -d "$d" ]] || continue
+
+        SAMPLE=$(basename "$d")
+        run_lengths "$SAMPLE"
+    done
+fi
+
+log "Contig length extraction completed"
+;;
+
+# ============================================================
+### CAT (CONTIG-LEVEL — TIARA MITOCHONDRIAL CONTIGS)
+### ARRAY OR SINGLE-SAMPLE
+# ============================================================
+cat_mito_contigs)
+
+set -euo pipefail
+shopt -s nullglob
+
+log "Starting CAT (mitochondrial contigs) step"
+
+# -------------------- CONFIG --------------------
+THREADS="${THREADS:-16}"
+
+TIARA_DIR="$OUTPUT_DIR/tiara"
+CAT_DIR="$OUTPUT_DIR/cat_mito"
+LOG_DIR="$OUTPUT_DIR/logs/cat_mito"
+
+CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
+CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
+CAT_CMD="${CAT_CMD:-CAT_pack}"
+
+mkdir -p "$CAT_DIR" "$LOG_DIR"
+
+log "THREADS: $THREADS"
+log "TIARA_DIR: $TIARA_DIR"
+log "CAT_DIR: $CAT_DIR"
+
+# ============================================================
+# INPUT DIRECTORY CHECK
+# ============================================================
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Tiara directory not found:"
+    log "$TIARA_DIR"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
+    log "ERROR: CAT_pack not found"
+    exit 1
+}
+
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
+    exit 1
+}
+
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
+
+run_cat_mito() {
+
+    local SAMPLE="$1"
+
+    local SAMPLE_DIR="$TIARA_DIR/$SAMPLE"
+    local CONTIGS="$SAMPLE_DIR/mito.fa"
+
+    local OUTDIR="$CAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}_mito"
+    local LOGFILE="$LOG_DIR/${SAMPLE}_mito.log"
+
+    local EXIT_CODE
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Mitochondrial contigs: $CONTIGS"
+    log "Output prefix: $PREFIX"
+
+    # ========================================================
+    # INPUT CHECK
+    # ========================================================
+
+    if [[ ! -d "$SAMPLE_DIR" ]]; then
+        log "ERROR: Tiara sample directory not found:"
+        log "$SAMPLE_DIR"
+        return 1
+    fi
+
+    # Missing mito.fa indicates an incomplete Tiara result
+    if [[ ! -e "$CONTIGS" ]]; then
+        log "ERROR: mito.fa does not exist:"
+        log "$CONTIGS"
+        return 1
+    fi
+
+    # Empty mito.fa is a valid Tiara result
+    if [[ ! -s "$CONTIGS" ]]; then
+        log "No mitochondrial contigs for $SAMPLE -> skipping CAT"
+        return 0
+    fi
+
+    # ========================================================
+    # SKIP IF DONE
+    # ========================================================
+
+    if [[ -s "${PREFIX}.contig2classification.txt" &&
+          "${FORCE:-0}" != "1" ]]; then
+
+        log "CAT mitochondrial classification already completed -> skipping"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous CAT mitochondrial directory:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # RUN CAT
+    # ========================================================
+
+    log "Running CAT_pack on mitochondrial contigs"
+
+    set +e
+
+    "$CAT_CMD" contigs \
+        -c "$CONTIGS" \
+        -d "$CAT_DB" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --nproc "$THREADS" \
+        --block_size 2 \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "CAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: CAT failed for mitochondrial contigs of $SAMPLE"
+        log "Last lines of CAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return 1
+    fi
+
+    # ========================================================
+    # VALIDATE
+    # ========================================================
+
+    if [[ ! -s "${PREFIX}.contig2classification.txt" ]]; then
+
+        log "ERROR: CAT completed but classification file is missing:"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 1
+    fi
+
+    log "Finished CAT mitochondrial classification for $SAMPLE"
+    log "Classification:"
+    log "${PREFIX}.contig2classification.txt"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_cat_mito "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
+
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
+
+    run_cat_mito "$SAMPLE"
+
+fi
+
+log "CAT mitochondrial contig step completed"
+
+;;
+
+# ============================================================
+### BAT (BIN-LEVEL — REMAG EUKARYOTIC BINS)
+### ARRAY OR SINGLE-SAMPLE
+# ============================================================
+bat_bins)
+
+set -euo pipefail
+shopt -s nullglob
+
+log "Starting BAT (bin-level, reMAG eukaryotic bins)"
+
+# -------------------- CONFIG --------------------
+THREADS="${THREADS:-16}"
+
+REMAG_DIR="$OUTPUT_DIR/remag"
+BAT_DIR="$OUTPUT_DIR/bat_bins"
+LOG_DIR="$OUTPUT_DIR/logs/bat_bins"
+
+CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
+CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
+CAT_CMD="${CAT_CMD:-CAT_pack}"
+
+mkdir -p "$BAT_DIR" "$LOG_DIR"
+
+log "THREADS: $THREADS"
+log "REMAG_DIR: $REMAG_DIR"
+log "BAT_DIR: $BAT_DIR"
+
+# ============================================================
+# INPUT DIRECTORY CHECK
+# ============================================================
+
+[[ -d "$REMAG_DIR" ]] || {
+    log "ERROR: reMAG directory not found:"
+    log "$REMAG_DIR"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
+    log "ERROR: CAT_pack not found"
+    exit 1
+}
+
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
+    exit 1
+}
+
+# ============================================================
+# FUNCTION: PROCESS ONE SAMPLE
+# ============================================================
+
+run_bat() {
+
+    local SAMPLE="$1"
+
+    local SAMPLE_DIR="$REMAG_DIR/$SAMPLE"
+    local BINS_DIR="$SAMPLE_DIR/bins"
+
+    local OUTDIR="$BAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local EXIT_CODE
+    local NBINS
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "reMAG directory: $SAMPLE_DIR"
+    log "Bins directory: $BINS_DIR"
+    log "Output prefix: $PREFIX"
+
+    # ========================================================
+    # INPUT CHECK
+    # ========================================================
+
+    if [[ ! -d "$SAMPLE_DIR" ]]; then
+        log "ERROR: reMAG sample directory not found:"
+        log "$SAMPLE_DIR"
+        return 1
+    fi
+
+    # No bins is a valid reMAG result
+    if [[ ! -d "$BINS_DIR" ]]; then
+        log "No bins directory for $SAMPLE -> skipping BAT"
+        return 0
+    fi
+
+    mapfile -t BIN_FILES < <(
+        find "$BINS_DIR" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.fa" \
+            -size +0c \
+            | sort
+    )
+
+    NBINS=${#BIN_FILES[@]}
+
+    if [[ "$NBINS" -eq 0 ]]; then
+        log "No non-empty reMAG bins for $SAMPLE -> skipping BAT"
+        return 0
+    fi
+
+    log "Number of bins: $NBINS"
+
+    # ========================================================
+    # SKIP IF DONE
+    # ========================================================
+
+    if [[ -s "${PREFIX}.bin2classification.txt" &&
+          "${FORCE:-0}" != "1" ]]; then
+
+        log "BAT already completed -> skipping"
+        log "${PREFIX}.bin2classification.txt"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous BAT directory:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # RUN BAT
+    # ========================================================
+
+    log "Running CAT_pack bins"
+
+    set +e
+
+    "$CAT_CMD" bins \
+        -b "$BINS_DIR" \
+        -d "$CAT_DB" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --bin_suffix .fa \
+        --nproc "$THREADS" \
+        --block_size 2 \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "BAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: BAT failed for $SAMPLE"
+        log "Last lines of BAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        return 1
+    fi
+
+    # ========================================================
+    # VALIDATE
+    # ========================================================
+
+    if [[ ! -s "${PREFIX}.bin2classification.txt" ]]; then
+
+        log "ERROR: BAT completed but classification file is missing:"
+        log "${PREFIX}.bin2classification.txt"
+
+        return 1
+    fi
+
+    log "Finished BAT for sample: $SAMPLE"
+    log "Classification:"
+    log "${PREFIX}.bin2classification.txt"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+# Backward compatibility
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_bat "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t SAMPLE_DIRS < <(
+        find "$REMAG_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total reMAG sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No reMAG sample directories found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    # -------------------- SELECT SAMPLE --------------------
+
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
+
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
+
+    run_bat "$SAMPLE"
+
+fi
+
+log "BAT bin-level step completed"
+
+;;
+
+# ============================================================
+### RAT (READ-LEVEL — TIARA EUK CONTIGS + CAT OUTPUTS)
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 rat_reads)
 
@@ -4932,311 +8510,442 @@ shopt -s nullglob
 
 log "Starting RAT (read-level classification)"
 
-# ------------------------------------------------------------
-# RAT is extremely memory hungry
-# ------------------------------------------------------------
+# -------------------- CONFIG --------------------
 THREADS="${THREADS:-8}"
 
 export OMP_NUM_THREADS="$THREADS"
 
 TRIM_DIR="$OUTPUT_DIR/trimmed"
-
-# TIARA contigs
 TIARA_DIR="$OUTPUT_DIR/tiara"
-
-# Cleaned contigs
 TIARA_CLEAN_DIR="$OUTPUT_DIR/tiara_clean"
 
-# Existing CAT outputs
 CAT_CONTIG_DIR="$OUTPUT_DIR/cat_contigs"
 
 RAT_DIR="$OUTPUT_DIR/rat_reads"
 LOG_DIR="$OUTPUT_DIR/logs/rat_reads"
 
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
 CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
 CAT_CMD="${CAT_CMD:-CAT_pack}"
 
-mkdir -p "$RAT_DIR" "$LOG_DIR" "$TIARA_CLEAN_DIR"
+mkdir -p \
+    "$RAT_DIR" \
+    "$LOG_DIR" \
+    "$TIARA_CLEAN_DIR"
+
+log "THREADS: $THREADS"
+log "TRIM_DIR: $TRIM_DIR"
+log "TIARA_DIR: $TIARA_DIR"
+log "CAT_CONTIG_DIR: $CAT_CONTIG_DIR"
+log "RAT_DIR: $RAT_DIR"
 
 # ============================================================
-# CHECK DEPENDENCIES
+# INPUT DIRECTORY CHECKS
 # ============================================================
-command -v "$CAT_CMD" >/dev/null || {
+
+[[ -d "$TRIM_DIR" ]] || {
+    log "ERROR: Trimmed-read directory not found:"
+    log "$TRIM_DIR"
+    exit 1
+}
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Tiara directory not found:"
+    log "$TIARA_DIR"
+    exit 1
+}
+
+[[ -d "$CAT_CONTIG_DIR" ]] || {
+    log "ERROR: CAT contig directory not found:"
+    log "$CAT_CONTIG_DIR"
+    exit 1
+}
+
+[[ -d "$CAT_TAX" ]] || {
+    log "ERROR: CAT taxonomy directory not found:"
+    log "$CAT_TAX"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
     log "ERROR: CAT_pack not found"
     exit 1
 }
 
-command -v diamond >/dev/null || {
-    log "ERROR: diamond not found"
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
     exit 1
 }
 
-command -v bwa >/dev/null || {
-    log "ERROR: bwa not found"
+command -v bwa >/dev/null 2>&1 || {
+    log "ERROR: BWA not found"
     exit 1
 }
 
-command -v samtools >/dev/null || {
+command -v samtools >/dev/null 2>&1 || {
     log "ERROR: samtools not found"
     exit 1
 }
 
 # ============================================================
-# COLLECT SAMPLES TO RUN
+# FUNCTION: PROCESS ONE SAMPLE
 # ============================================================
-PENDING_SAMPLES=()
 
-for f in "$TRIM_DIR"/*_trimmed_R1.fastq.gz; do
+run_rat() {
 
-    [[ -s "$f" ]] || continue
+    local SAMPLE="$1"
 
-    SAMPLE=$(basename "$f" | sed 's/_trimmed_R1.fastq.gz//')
+    local R1="$TRIM_DIR/${SAMPLE}_trimmed_R1.fastq.gz"
+    local R2="$TRIM_DIR/${SAMPLE}_trimmed_R2.fastq.gz"
 
-    # --------------------------------------------------------
-    # OPTIONAL: explicit target sample
-    # --------------------------------------------------------
-    if [[ -n "${TARGET_SAMPLE:-}" ]]; then
+    local RAW_CONTIGS="$TIARA_DIR/$SAMPLE/euk.fa"
 
-        if [[ "$SAMPLE" != "$TARGET_SAMPLE" ]]; then
-            continue
-        fi
+    local CLEAN_DIR="$TIARA_CLEAN_DIR/$SAMPLE"
+    local CONTIGS="$CLEAN_DIR/euk_clean.fa"
+
+    local CAT_SAMPLE_DIR="$CAT_CONTIG_DIR/$SAMPLE"
+
+    local RAW_C2C
+    local CAT_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.clean.txt"
+
+    local OUTDIR="$RAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+
+    local RAT_TMPDIR="$OUTDIR/tmp"
+    local DUMMY_U2C="$OUTDIR/dummy_u2c.txt"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local COMPLETE_FILE="${PREFIX}.RAT.complete.abundance.txt"
+    local CONTIG_FILE="${PREFIX}.RAT.contig.abundance.txt"
+    local READ_FILE="${PREFIX}.RAT.read2classification.txt"
+
+    local EXIT_CODE
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "R1: $R1"
+    log "R2: $R2"
+    log "Raw euk contigs: $RAW_CONTIGS"
+    log "RAT output: $OUTDIR"
+
+    # ========================================================
+    # INPUT CHECK: READS
+    # ========================================================
+
+    [[ -s "$R1" ]] || {
+        log "ERROR: Missing R1:"
+        log "$R1"
+        return 1
+    }
+
+    [[ -s "$R2" ]] || {
+        log "ERROR: Missing R2:"
+        log "$R2"
+        return 1
+    }
+
+    # ========================================================
+    # INPUT CHECK: TIARA EUKARYOTIC CONTIGS
+    # ========================================================
+
+    if [[ ! -e "$RAW_CONTIGS" ]]; then
+        log "ERROR: Tiara euk.fa does not exist:"
+        log "$RAW_CONTIGS"
+        return 1
     fi
 
-    PREFIX="$RAT_DIR/$SAMPLE/${SAMPLE}"
-
-    # --------------------------------------------------------
-    # SUCCESS CHECK
-    # --------------------------------------------------------
-    COMPLETE_FILE="${PREFIX}.RAT.complete.abundance.txt"
-    CONTIG_FILE="${PREFIX}.RAT.contig.abundance.txt"
-    READ_FILE="${PREFIX}.RAT.read2classification.txt"
-
-    if [[ -s "$COMPLETE_FILE" && -s "$CONTIG_FILE" && -s "$READ_FILE" ]]; then
-
-        if [[ "${FORCE:-0}" != "1" ]]; then
-            log "Already completed → skipping $SAMPLE"
-            continue
-        fi
+    # Empty euk.fa is a legitimate Tiara result
+    if [[ ! -s "$RAW_CONTIGS" ]]; then
+        log "No eukaryotic contigs for $SAMPLE -> skipping RAT"
+        return 0
     fi
 
-    PENDING_SAMPLES+=("$SAMPLE")
-done
+    # ========================================================
+    # CAT CONTIG CLASSIFICATION
+    # ========================================================
+    #
+    # Support both possible CAT filename conventions:
+    #   sample.contig2classification.txt
+    #   sample.contig2classification.txt
+    #
 
-N=${#PENDING_SAMPLES[@]}
+    if [[ -s "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt" ]]; then
 
-log "Samples pending RAT: $N"
+        RAW_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
 
-[[ "$N" -gt 0 ]] || {
-    log "No samples need RAT"
-    exit 0
+    elif [[ -s "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt" ]]; then
+
+        RAW_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+
+    else
+
+        log "ERROR: CAT contig classification not found for $SAMPLE"
+        log "Checked:"
+        log "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+        log "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+
+        return 1
+    fi
+
+    log "CAT classification: $RAW_C2C"
+
+    # ========================================================
+    # SKIP IF COMPLETED
+    # ========================================================
+
+    if [[ -s "$COMPLETE_FILE" &&
+          -s "$CONTIG_FILE" &&
+          -s "$READ_FILE" &&
+          "${FORCE:-0}" != "1" ]]; then
+
+        log "RAT already completed -> skipping"
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL RAT OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous RAT output:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p \
+        "$OUTDIR" \
+        "$RAT_TMPDIR" \
+        "$CLEAN_DIR"
+
+    rm -f "$LOGFILE"
+
+    # ========================================================
+    # CLEAN FASTA HEADERS
+    # ========================================================
+
+    log "Cleaning FASTA headers"
+
+    awk '
+    /^>/ {
+        sub(/^>/, "")
+        split($0, a, " ")
+        print ">" a[1]
+        next
+    }
+    {
+        print
+    }
+    ' "$RAW_CONTIGS" > "$CONTIGS"
+
+    [[ -s "$CONTIGS" ]] || {
+        log "ERROR: Cleaned contig FASTA is empty"
+        return 1
+    }
+
+    # ========================================================
+    # CLEAN CAT CONTIG CLASSIFICATION
+    # ========================================================
+
+    log "Cleaning CAT contig classification"
+
+    awk '
+    BEGIN {
+        FS=OFS="\t"
+    }
+
+    /^#/ {
+        print
+        next
+    }
+
+    {
+        split($1, a, " ")
+        $1=a[1]
+        print
+    }
+    ' "$RAW_C2C" > "$CAT_C2C"
+
+    [[ -s "$CAT_C2C" ]] || {
+        log "ERROR: Cleaned CAT classification is empty"
+        return 1
+    }
+
+    # ========================================================
+    # DUMMY U2C FILE
+    # ========================================================
+
+    touch "$DUMMY_U2C"
+
+    # ========================================================
+    # RUN RAT
+    # ========================================================
+
+    log "Running CAT_pack reads (RAT)"
+
+    set +e
+
+    "$CAT_CMD" reads \
+        --mode cr \
+        -c "$CONTIGS" \
+        --c2c "$CAT_C2C" \
+        --u2c "$DUMMY_U2C" \
+        -1 "$R1" \
+        -2 "$R2" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --tmpdir "$RAT_TMPDIR" \
+        --read2classification \
+        --force \
+        --nproc "$THREADS" \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "RAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: RAT failed for $SAMPLE"
+        log "Last lines of RAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        rm -f "$DUMMY_U2C"
+
+        return 1
+    fi
+
+    # ========================================================
+    # VALIDATE OUTPUT
+    # ========================================================
+
+    [[ -s "$READ_FILE" ]] || {
+        log "ERROR: Missing RAT read2classification output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    [[ -s "$COMPLETE_FILE" ]] || {
+        log "ERROR: Missing RAT complete abundance output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    [[ -s "$CONTIG_FILE" ]] || {
+        log "ERROR: Missing RAT contig abundance output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    log "RAT outputs generated:"
+
+    ls -lh "$OUTDIR"/*.RAT.* 2>/dev/null || true
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    rm -f "$DUMMY_U2C"
+
+    if [[ "${DEBUG:-0}" != "1" ]]; then
+        rm -rf "$RAT_TMPDIR"
+    else
+        log "DEBUG=1 -> keeping RAT temporary directory:"
+        log "$RAT_TMPDIR"
+    fi
+
+    log "Finished RAT for $SAMPLE"
+
+    return 0
 }
-
-printf '%s\n' "${PENDING_SAMPLES[@]}" \
-    > "$LOG_DIR/rat_pending_samples.txt"
-
-log "Pending samples:"
-cat "$LOG_DIR/rat_pending_samples.txt"
 
 # ============================================================
 # SAMPLE SELECTION
 # ============================================================
 
-# ------------------------------------------------------------
-# CASE 1: explicit TARGET_SAMPLE
-# ------------------------------------------------------------
-if [[ -n "${TARGET_SAMPLE:-}" ]]; then
-
+# Backward compatibility:
+# TARGET_SAMPLE still works, but SAMPLE is now preferred.
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
     SAMPLE="$TARGET_SAMPLE"
+fi
 
-# ------------------------------------------------------------
-# CASE 2: SLURM ARRAY
-# ------------------------------------------------------------
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_rat "$SAMPLE"
+
 else
 
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    # Use Tiara directories as the stable sample set.
+    # Samples with an empty euk.fa will simply skip inside
+    # run_rat().
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    }
+
+    # -------------------- ARRAY CHECK --------------------
+
     if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-        log "ERROR: Must run as SLURM array or use TARGET_SAMPLE"
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
         exit 1
     fi
 
     if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-        log "No sample for this array index"
-        exit 0
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
     fi
 
-    SAMPLE="${PENDING_SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
+    # -------------------- SELECT SAMPLE --------------------
+
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
+
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
+
+    run_rat "$SAMPLE"
+
 fi
 
-log "Selected sample: $SAMPLE"
+log "RAT read-level step completed"
 
-# ============================================================
-# INPUT FILES
-# ============================================================
-R1="$TRIM_DIR/${SAMPLE}_trimmed_R1.fastq.gz"
-R2="$TRIM_DIR/${SAMPLE}_trimmed_R2.fastq.gz"
-
-RAW_CONTIGS="$TIARA_DIR/$SAMPLE/euk.fa"
-
-CLEAN_DIR="$TIARA_CLEAN_DIR/$SAMPLE"
-mkdir -p "$CLEAN_DIR"
-
-CONTIGS="$CLEAN_DIR/euk_clean.fa"
-
-RAW_C2C="$CAT_CONTIG_DIR/$SAMPLE/${SAMPLE}.contig2classification.txt"
-
-CAT_C2C="$CAT_CONTIG_DIR/$SAMPLE/${SAMPLE}.contig2classification.clean.txt"
-
-OUTDIR="$RAT_DIR/$SAMPLE"
-PREFIX="$OUTDIR/${SAMPLE}"
-
-TMPDIR="$OUTDIR/tmp"
-
-DUMMY_U2C="$OUTDIR/dummy_u2c.txt"
-
-log "----------------------------------------"
-log "Sample:         $SAMPLE"
-log "R1:             $R1"
-log "R2:             $R2"
-log "Raw contigs:    $RAW_CONTIGS"
-log "Clean contigs:  $CONTIGS"
-log "CAT C2C:        $CAT_C2C"
-log "TMPDIR:         $TMPDIR"
-log "THREADS:        $THREADS"
-
-# ============================================================
-# INPUT CHECKS
-# ============================================================
-[[ -s "$R1" ]] || {
-    log "ERROR: Missing R1"
-    exit 1
-}
-
-[[ -s "$R2" ]] || {
-    log "ERROR: Missing R2"
-    exit 1
-}
-
-[[ -s "$RAW_CONTIGS" ]] || {
-    log "ERROR: Missing Tiara euk.fa"
-    exit 1
-}
-
-[[ -s "$RAW_C2C" ]] || {
-    log "ERROR: Missing CAT contig2classification"
-    exit 1
-}
-
-[[ -d "$CAT_TAX" ]] || {
-    log "ERROR: Missing CAT taxonomy"
-    exit 1
-}
-
-# ============================================================
-# CLEAN OUTPUT ONLY FOR CURRENT SAMPLE
-# ============================================================
-rm -rf "$OUTDIR"
-
-mkdir -p "$OUTDIR" "$TMPDIR"
-
-touch "$DUMMY_U2C"
-
-# ============================================================
-# CLEAN FASTA HEADERS
-# ============================================================
-log "Cleaning FASTA headers"
-
-awk '
-/^>/ {
-    sub(/^>/,"")
-    split($0,a," ")
-    print ">"a[1]
-    next
-}
-{print}
-' \
-"$RAW_CONTIGS" \
-> "$CONTIGS"
-
-# ============================================================
-# CLEAN CAT contig2classification
-# ============================================================
-log "Cleaning CAT contig2classification"
-
-awk '
-BEGIN{FS=OFS="\t"}
-/^#/ {print; next}
-{
-    split($1,a," ")
-    $1=a[1]
-    print
-}
-' \
-"$RAW_C2C" \
-> "$CAT_C2C"
-
-# ============================================================
-# VALIDATE CLEAN FILES
-# ============================================================
-[[ -s "$CONTIGS" ]] || {
-    log "ERROR: Cleaned contigs file failed"
-    exit 1
-}
-
-[[ -s "$CAT_C2C" ]] || {
-    log "ERROR: Cleaned CAT file failed"
-    exit 1
-}
-
-# ============================================================
-# RUN RAT
-# ============================================================
-log "Running RAT"
-
-"$CAT_CMD" reads \
-    --mode cr \
-    -c "$CONTIGS" \
-    --c2c "$CAT_C2C" \
-    --u2c "$DUMMY_U2C" \
-    -1 "$R1" \
-    -2 "$R2" \
-    -t "$CAT_TAX" \
-    -o "$PREFIX" \
-    --tmpdir "$TMPDIR" \
-    --read2classification \
-    --force \
-    --nproc "$THREADS" \
-    2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-# ============================================================
-# VALIDATE OUTPUT
-# ============================================================
-[[ -s "${PREFIX}.RAT.read2classification.txt" ]] || {
-    log "ERROR: Missing read2classification output"
-    exit 1
-}
-
-[[ -s "${PREFIX}.RAT.complete.abundance.txt" ]] || {
-    log "ERROR: Missing complete abundance output"
-    exit 1
-}
-
-[[ -s "${PREFIX}.RAT.contig.abundance.txt" ]] || {
-    log "ERROR: Missing contig abundance output"
-    exit 1
-}
-
-# ============================================================
-# OUTPUT SUMMARY
-# ============================================================
-log "Generated outputs:"
-ls -lh "$OUTDIR"/*.RAT.* || true
-
-# ============================================================
-# CLEANUP
-# ============================================================
-rm -f "$DUMMY_U2C"
-
-log "Finished RAT for $SAMPLE"
 ;;
 
 # ============================================================
@@ -5509,19 +9218,319 @@ log "Finished euk read length extraction for $SAMPLE"
 ;;
 
 # ============================================================
+### CAT (CONTIG-LEVEL — TIARA PROKARYOTIC CONTIGS)
+# ============================================================
+cat_contigs_prok)
+
+set -euo pipefail
+shopt -s nullglob
+
+log "Starting CAT (contig-level, prok)"
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+THREADS="${THREADS:-8}"
+
+TIARA_DIR="$OUTPUT_DIR/tiara"
+CAT_DIR="$OUTPUT_DIR/cat_contigs_prok"
+LOG_DIR="$OUTPUT_DIR/logs/cat_contigs_prok"
+
+CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
+CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
+
+CAT_CMD="${CAT_CMD:-CAT_pack}"
+
+# Backward compatibility:
+# if TARGET_SAMPLE was supplied but SAMPLE was not,
+# use TARGET_SAMPLE as SAMPLE.
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
+    SAMPLE="$TARGET_SAMPLE"
+fi
+
+mkdir -p "$CAT_DIR" "$LOG_DIR"
+
+log "THREADS: $THREADS"
+log "TIARA_DIR: $TIARA_DIR"
+log "CAT_DIR: $CAT_DIR"
+
+# ============================================================
+# INPUT DIRECTORY CHECK
+# ============================================================
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Tiara directory not found:"
+    log "$TIARA_DIR"
+    exit 1
+}
+
+# ============================================================
+# DATABASE CHECKS
+# ============================================================
+
+[[ -d "$CAT_DB" ]] || {
+    log "ERROR: CAT database directory not found:"
+    log "$CAT_DB"
+    exit 1
+}
+
+[[ -d "$CAT_TAX" ]] || {
+    log "ERROR: CAT taxonomy directory not found:"
+    log "$CAT_TAX"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECKS
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
+    log "ERROR: CAT_pack not found"
+    exit 1
+}
+
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
+    exit 1
+}
+
+log "CAT executable: $(command -v "$CAT_CMD")"
+log "DIAMOND executable: $(command -v diamond)"
+
+# ============================================================
+# FUNCTION TO PROCESS ONE SAMPLE
+# ============================================================
+
+run_cat() {
+
+    local SAMPLE="$1"
+
+    local SAMPLE_DIR="$TIARA_DIR/$SAMPLE"
+    local CONTIGS="$SAMPLE_DIR/prok.fa"
+
+    local OUTDIR="$CAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+
+    local CAT_LOG="$LOG_DIR/${SAMPLE}.log"
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "Input: $CONTIGS"
+    log "Output: $OUTDIR"
+
+    # ========================================================
+    # SAMPLE DIRECTORY CHECK
+    # ========================================================
+
+    [[ -d "$SAMPLE_DIR" ]] || {
+        log "ERROR: Tiara sample directory not found:"
+        log "$SAMPLE_DIR"
+        return 1
+    }
+
+    # ========================================================
+    # INPUT CHECK
+    # ========================================================
+
+    if [[ ! -e "$CONTIGS" ]]; then
+        log "ERROR: prok.fa does not exist:"
+        log "$CONTIGS"
+        return 1
+    fi
+
+    if [[ ! -s "$CONTIGS" ]]; then
+        log "No prokaryotic contigs detected for $SAMPLE"
+        log "CAT classification not required -> skipping"
+        return 0
+    fi
+
+    # ========================================================
+    # SKIP COMPLETED
+    # ========================================================
+
+    if [[ -s "${PREFIX}.contig2classification.txt" &&
+          "${FORCE:-0}" != "1" ]]; then
+
+        log "CAT already completed -> skipping"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 0
+    fi
+
+    # ========================================================
+    # CLEAN OLD / PARTIAL OUTPUT
+    # ========================================================
+
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous CAT output:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
+
+    mkdir -p "$OUTDIR"
+
+    # Remove old sample log before rerunning
+    rm -f "$CAT_LOG"
+
+    # ========================================================
+    # RUN CAT
+    # ========================================================
+
+    log "Running CAT_pack contigs"
+    log "Threads: $THREADS"
+
+    set +e
+
+    "$CAT_CMD" contigs \
+        -c "$CONTIGS" \
+        -d "$CAT_DB" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --nproc "$THREADS" \
+        --block_size 2 \
+        2>&1 | tee "$CAT_LOG"
+
+    local EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "CAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: CAT failed for $SAMPLE"
+        log "Last 50 lines of CAT log:"
+
+        tail -n 50 "$CAT_LOG" || true
+
+        return "$EXIT_CODE"
+    fi
+
+    # ========================================================
+    # VALIDATE OUTPUT
+    # ========================================================
+
+    if [[ ! -s "${PREFIX}.contig2classification.txt" ]]; then
+
+        log "ERROR: CAT finished but classification output is missing:"
+        log "${PREFIX}.contig2classification.txt"
+
+        return 1
+    fi
+
+    log "Finished CAT for sample: $SAMPLE"
+
+    return 0
+}
+
+# ============================================================
+# SAMPLE SELECTION
+# ============================================================
+
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+    log "Sample: $SAMPLE"
+
+    run_cat "$SAMPLE"
+
+elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
+
+    log "Running in array mode"
+
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    if (( N == 0 )); then
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    fi
+
+    if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
+        log "ERROR: Array task ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
+        exit 1
+    fi
+
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
+
+    log "Array task ${SLURM_ARRAY_TASK_ID} -> $SAMPLE"
+
+    run_cat "$SAMPLE"
+
+else
+
+    # --------------------------------------------------------
+    # LOCAL / SEQUENTIAL MODE
+    # --------------------------------------------------------
+
+    log "Running in local sequential mode"
+
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    if (( N == 0 )); then
+        log "ERROR: No Tiara sample directories found"
+        exit 1
+    fi
+
+    log "Total Tiara samples detected: $N"
+
+    for SAMPLE_DIR in "${SAMPLE_DIRS[@]}"; do
+
+        SAMPLE=$(basename "$SAMPLE_DIR")
+
+        run_cat "$SAMPLE"
+
+    done
+
+fi
+
+log "CAT prok contig step completed"
+
+;;
+
+# ============================================================
 ### RAT (READ-LEVEL — TIARA PROK CONTIGS + CAT PROK OUTPUTS)
-### RUN NEW SAMPLES + RERUN FAILED ONLY
+### ARRAY OR SINGLE-SAMPLE
 # ============================================================
 rat_reads_prok)
 
 set -euo pipefail
 shopt -s nullglob
 
-log "Starting RAT (read-level classification, prok)"
+log "Starting RAT (read-level classification, prokaryotic contigs)"
 
-# ============================================================
-# CONFIG
-# ============================================================
+# -------------------- CONFIG --------------------
 THREADS="${THREADS:-8}"
 
 export OMP_NUM_THREADS="$THREADS"
@@ -5531,785 +9540,441 @@ export NUMEXPR_NUM_THREADS=1
 
 TRIM_DIR="$OUTPUT_DIR/trimmed"
 
-# Tiara outputs
 TIARA_DIR="$OUTPUT_DIR/tiara"
-
-# Cleaned prok contigs
 TIARA_CLEAN_DIR="$OUTPUT_DIR/tiara_clean_prok"
 
-# Existing CAT prok outputs
 CAT_CONTIG_DIR="$OUTPUT_DIR/cat_contigs_prok"
 
 RAT_DIR="$OUTPUT_DIR/rat_reads_prok"
-
 LOG_DIR="$OUTPUT_DIR/logs/rat_reads_prok"
 
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
-
 CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
-
 CAT_CMD="${CAT_CMD:-CAT_pack}"
 
-mkdir -p "$RAT_DIR" "$LOG_DIR" "$TIARA_CLEAN_DIR"
+mkdir -p \
+    "$RAT_DIR" \
+    "$LOG_DIR" \
+    "$TIARA_CLEAN_DIR"
+
+log "THREADS: $THREADS"
+log "TRIM_DIR: $TRIM_DIR"
+log "TIARA_DIR: $TIARA_DIR"
+log "CAT_CONTIG_DIR: $CAT_CONTIG_DIR"
+log "RAT_DIR: $RAT_DIR"
 
 # ============================================================
-# CHECK DEPENDENCIES
+# INPUT DIRECTORY CHECKS
 # ============================================================
-command -v "$CAT_CMD" >/dev/null || {
+
+[[ -d "$TRIM_DIR" ]] || {
+    log "ERROR: Trimmed-read directory not found:"
+    log "$TRIM_DIR"
+    exit 1
+}
+
+[[ -d "$TIARA_DIR" ]] || {
+    log "ERROR: Tiara directory not found:"
+    log "$TIARA_DIR"
+    exit 1
+}
+
+[[ -d "$CAT_CONTIG_DIR" ]] || {
+    log "ERROR: CAT prok contig directory not found:"
+    log "$CAT_CONTIG_DIR"
+    exit 1
+}
+
+[[ -d "$CAT_TAX" ]] || {
+    log "ERROR: CAT taxonomy directory not found:"
+    log "$CAT_TAX"
+    exit 1
+}
+
+# ============================================================
+# DEPENDENCY CHECK
+# ============================================================
+
+command -v "$CAT_CMD" >/dev/null 2>&1 || {
     log "ERROR: CAT_pack not found"
     exit 1
 }
 
-command -v diamond >/dev/null || {
-    log "ERROR: diamond not found"
+command -v diamond >/dev/null 2>&1 || {
+    log "ERROR: DIAMOND not found"
     exit 1
 }
 
-command -v bwa >/dev/null || {
-    log "ERROR: bwa not found"
+command -v bwa >/dev/null 2>&1 || {
+    log "ERROR: BWA not found"
     exit 1
 }
 
-command -v samtools >/dev/null || {
+command -v samtools >/dev/null 2>&1 || {
     log "ERROR: samtools not found"
     exit 1
 }
 
 # ============================================================
-# COLLECT PENDING SAMPLES
+# FUNCTION: PROCESS ONE SAMPLE
 # ============================================================
-PENDING_SAMPLES=()
 
-for f in "$TRIM_DIR"/*_trimmed_R1.fastq.gz; do
+run_rat_prok() {
 
-    [[ -s "$f" ]] || continue
+    local SAMPLE="$1"
 
-    SAMPLE=$(basename "$f" | sed 's/_trimmed_R1.fastq.gz//')
+    local R1="$TRIM_DIR/${SAMPLE}_trimmed_R1.fastq.gz"
+    local R2="$TRIM_DIR/${SAMPLE}_trimmed_R2.fastq.gz"
 
-    # --------------------------------------------------------
-    # OPTIONAL TARGET SAMPLE
-    # --------------------------------------------------------
-    if [[ -n "${TARGET_SAMPLE:-}" ]]; then
+    local RAW_CONTIGS="$TIARA_DIR/$SAMPLE/prok.fa"
 
-        [[ "$SAMPLE" == "$TARGET_SAMPLE" ]] || continue
+    local CLEAN_DIR="$TIARA_CLEAN_DIR/$SAMPLE"
+    local CONTIGS="$CLEAN_DIR/prok_clean.fa"
+
+    local CAT_SAMPLE_DIR="$CAT_CONTIG_DIR/$SAMPLE"
+
+    local RAW_C2C
+    local CAT_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.clean.txt"
+
+    local OUTDIR="$RAT_DIR/$SAMPLE"
+    local PREFIX="$OUTDIR/${SAMPLE}"
+
+    local RAT_TMPDIR="$OUTDIR/tmp"
+    local DUMMY_U2C="$OUTDIR/dummy_u2c.txt"
+
+    local LOGFILE="$LOG_DIR/${SAMPLE}.log"
+
+    local COMPLETE_FILE="${PREFIX}.RAT.complete.abundance.txt"
+    local CONTIG_FILE="${PREFIX}.RAT.contig.abundance.txt"
+    local READ_FILE="${PREFIX}.RAT.read2classification.txt"
+
+    local EXIT_CODE
+
+    log "----------------------------------------"
+    log "Processing sample: $SAMPLE"
+    log "R1: $R1"
+    log "R2: $R2"
+    log "Raw prok contigs: $RAW_CONTIGS"
+    log "RAT output: $OUTDIR"
+
+    # ========================================================
+    # INPUT CHECK: READS
+    # ========================================================
+
+    [[ -s "$R1" ]] || {
+        log "ERROR: Missing R1:"
+        log "$R1"
+        return 1
+    }
+
+    [[ -s "$R2" ]] || {
+        log "ERROR: Missing R2:"
+        log "$R2"
+        return 1
+    }
+
+    # ========================================================
+    # INPUT CHECK: TIARA PROKARYOTIC CONTIGS
+    # ========================================================
+
+    if [[ ! -e "$RAW_CONTIGS" ]]; then
+        log "ERROR: Tiara prok.fa does not exist:"
+        log "$RAW_CONTIGS"
+        return 1
     fi
 
-    PREFIX="$RAT_DIR/$SAMPLE/${SAMPLE}"
+    # Empty prok.fa is a valid Tiara result
+    if [[ ! -s "$RAW_CONTIGS" ]]; then
+        log "No prokaryotic contigs for $SAMPLE -> skipping RAT"
+        return 0
+    fi
 
-    COMPLETE_FILE="${PREFIX}.RAT.complete.abundance.txt"
+    # ========================================================
+    # CAT PROK CONTIG CLASSIFICATION
+    # ========================================================
+    #
+    # Support either CAT naming convention:
+    #
+    #   SAMPLE.contig2classification.txt
+    #   SAMPLE.contig2classification.txt
+    #
 
-    CONTIG_FILE="${PREFIX}.RAT.contig.abundance.txt"
+    if [[ -s "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt" ]]; then
 
-    READ_FILE="${PREFIX}.RAT.read2classification.txt"
+        RAW_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
 
-    # --------------------------------------------------------
-    # SKIP COMPLETED
-    # --------------------------------------------------------
+    elif [[ -s "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt" ]]; then
+
+        RAW_C2C="$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+
+    else
+
+        log "ERROR: CAT prok contig classification not found for $SAMPLE"
+        log "Checked:"
+        log "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+        log "$CAT_SAMPLE_DIR/${SAMPLE}.contig2classification.txt"
+
+        return 1
+    fi
+
+    log "CAT classification: $RAW_C2C"
+
+    # ========================================================
+    # SKIP IF COMPLETED
+    # ========================================================
+
     if [[ -s "$COMPLETE_FILE" &&
           -s "$CONTIG_FILE" &&
           -s "$READ_FILE" &&
           "${FORCE:-0}" != "1" ]]; then
 
-        log "Already completed → skipping $SAMPLE"
-
-        continue
+        log "RAT prok already completed -> skipping"
+        return 0
     fi
 
-    PENDING_SAMPLES+=("$SAMPLE")
-done
+    # ========================================================
+    # CLEAN OLD / PARTIAL RAT OUTPUT
+    # ========================================================
 
-N=${#PENDING_SAMPLES[@]}
+    if [[ -d "$OUTDIR" ]]; then
+        log "Removing previous RAT prok output:"
+        log "$OUTDIR"
+        rm -rf "$OUTDIR"
+    fi
 
-log "Samples pending RAT: $N"
+    mkdir -p \
+        "$OUTDIR" \
+        "$RAT_TMPDIR" \
+        "$CLEAN_DIR"
 
-[[ "$N" -gt 0 ]] || {
+    rm -f "$LOGFILE"
 
-    log "No samples require RAT"
+    # ========================================================
+    # CLEAN FASTA HEADERS
+    # ========================================================
 
-    exit 0
+    log "Cleaning prokaryotic FASTA headers"
+
+    awk '
+    /^>/ {
+        sub(/^>/, "")
+        split($0, a, " ")
+        print ">" a[1]
+        next
+    }
+    {
+        print
+    }
+    ' "$RAW_CONTIGS" > "$CONTIGS"
+
+    [[ -s "$CONTIGS" ]] || {
+        log "ERROR: Cleaned prokaryotic FASTA is empty"
+        return 1
+    }
+
+    # ========================================================
+    # CLEAN CAT CONTIG CLASSIFICATION
+    # ========================================================
+
+    log "Cleaning CAT prok contig classification"
+
+    awk '
+    BEGIN {
+        FS=OFS="\t"
+    }
+
+    /^#/ {
+        print
+        next
+    }
+
+    {
+        split($1, a, " ")
+        $1=a[1]
+        print
+    }
+    ' "$RAW_C2C" > "$CAT_C2C"
+
+    [[ -s "$CAT_C2C" ]] || {
+        log "ERROR: Cleaned CAT classification is empty"
+        return 1
+    }
+
+    # ========================================================
+    # DUMMY U2C FILE
+    # ========================================================
+
+    touch "$DUMMY_U2C"
+
+    # ========================================================
+    # RUN RAT
+    # ========================================================
+
+    log "Running CAT_pack reads (RAT prok)"
+
+    set +e
+
+    "$CAT_CMD" reads \
+        --mode cr \
+        -c "$CONTIGS" \
+        --c2c "$CAT_C2C" \
+        --u2c "$DUMMY_U2C" \
+        -1 "$R1" \
+        -2 "$R2" \
+        -t "$CAT_TAX" \
+        -o "$PREFIX" \
+        --tmpdir "$RAT_TMPDIR" \
+        --read2classification \
+        --force \
+        --nproc "$THREADS" \
+        2>&1 | tee "$LOGFILE"
+
+    EXIT_CODE=${PIPESTATUS[0]}
+
+    set -e
+
+    log "RAT exit code: $EXIT_CODE"
+
+    # ========================================================
+    # HANDLE FAILURE
+    # ========================================================
+
+    if [[ "$EXIT_CODE" -ne 0 ]]; then
+
+        log "ERROR: RAT prok failed for $SAMPLE"
+        log "Last lines of RAT log:"
+
+        tail -n 50 "$LOGFILE" || true
+
+        rm -f "$DUMMY_U2C"
+
+        return 1
+    fi
+
+    # ========================================================
+    # VALIDATE OUTPUT
+    # ========================================================
+
+    [[ -s "$READ_FILE" ]] || {
+        log "ERROR: Missing RAT read2classification output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    [[ -s "$COMPLETE_FILE" ]] || {
+        log "ERROR: Missing RAT complete abundance output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    [[ -s "$CONTIG_FILE" ]] || {
+        log "ERROR: Missing RAT contig abundance output"
+        rm -f "$DUMMY_U2C"
+        return 1
+    }
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    log "RAT prok outputs generated:"
+
+    ls -lh "$OUTDIR"/*.RAT.* 2>/dev/null || true
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    rm -f "$DUMMY_U2C"
+
+    if [[ "${DEBUG:-0}" != "1" ]]; then
+
+        rm -rf "$RAT_TMPDIR"
+
+    else
+
+        log "DEBUG=1 -> keeping RAT temporary directory:"
+        log "$RAT_TMPDIR"
+
+    fi
+
+    log "Finished RAT prok for $SAMPLE"
+
+    return 0
 }
-
-printf '%s\n' "${PENDING_SAMPLES[@]}" \
-    > "$LOG_DIR/rat_prok_pending_samples.txt"
-
-log "Pending samples:"
-cat "$LOG_DIR/rat_prok_pending_samples.txt"
 
 # ============================================================
 # SAMPLE SELECTION
 # ============================================================
 
-# ------------------------------------------------------------
-# TARGET SAMPLE
-# ------------------------------------------------------------
-if [[ -n "${TARGET_SAMPLE:-}" ]]; then
-
+# Backward compatibility:
+# TARGET_SAMPLE still works, but SAMPLE is preferred.
+if [[ -z "${SAMPLE:-}" && -n "${TARGET_SAMPLE:-}" ]]; then
     SAMPLE="$TARGET_SAMPLE"
+fi
 
-# ------------------------------------------------------------
-# ARRAY MODE
-# ------------------------------------------------------------
+if [[ -n "${SAMPLE:-}" ]]; then
+
+    # --------------------------------------------------------
+    # SINGLE-SAMPLE MODE
+    # --------------------------------------------------------
+
+    log "Running in single-sample mode"
+
+    run_rat_prok "$SAMPLE"
+
 else
 
-    [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]] || {
+    # --------------------------------------------------------
+    # ARRAY MODE
+    # --------------------------------------------------------
 
-        log "ERROR: Must run as array job or TARGET_SAMPLE"
+    log "Running in array mode"
 
+    # Stable sample list based on Tiara directories.
+    # Samples with empty prok.fa simply skip inside
+    # run_rat_prok().
+    mapfile -t SAMPLE_DIRS < <(
+        find "$TIARA_DIR" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            | sort
+    )
+
+    N=${#SAMPLE_DIRS[@]}
+
+    log "Total Tiara sample directories detected: $N"
+
+    [[ "$N" -gt 0 ]] || {
+        log "ERROR: No Tiara sample directories found"
         exit 1
     }
+
+    # -------------------- ARRAY CHECK --------------------
+
+    if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+        log "ERROR: Run as array job or export SAMPLE=<sample>"
+        exit 1
+    fi
 
     if (( SLURM_ARRAY_TASK_ID < 1 || SLURM_ARRAY_TASK_ID > N )); then
-
-        log "No sample assigned to this array index"
-
-        exit 0
-    fi
-
-    SAMPLE="${PENDING_SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-fi
-
-log "Selected sample: $SAMPLE"
-
-# ============================================================
-# INPUT FILES
-# ============================================================
-R1="$TRIM_DIR/${SAMPLE}_trimmed_R1.fastq.gz"
-
-R2="$TRIM_DIR/${SAMPLE}_trimmed_R2.fastq.gz"
-
-RAW_CONTIGS="$TIARA_DIR/$SAMPLE/prok.fa"
-
-CLEAN_DIR="$TIARA_CLEAN_DIR/$SAMPLE"
-
-mkdir -p "$CLEAN_DIR"
-
-CONTIGS="$CLEAN_DIR/prok_clean.fa"
-
-RAW_C2C="$CAT_CONTIG_DIR/$SAMPLE/${SAMPLE}.contig2classification.txt"
-
-CAT_C2C="$CAT_CONTIG_DIR/$SAMPLE/${SAMPLE}.contig2classification.clean.txt"
-
-OUTDIR="$RAT_DIR/$SAMPLE"
-
-PREFIX="$OUTDIR/${SAMPLE}"
-
-TMPDIR="$OUTDIR/tmp"
-
-DUMMY_U2C="$OUTDIR/dummy_u2c.txt"
-
-# ============================================================
-# DEBUG
-# ============================================================
-log "----------------------------------------"
-
-log "Sample:         $SAMPLE"
-
-log "R1:             $R1"
-
-log "R2:             $R2"
-
-log "Raw contigs:    $RAW_CONTIGS"
-
-log "Clean contigs:  $CONTIGS"
-
-log "CAT C2C:        $CAT_C2C"
-
-log "TMPDIR:         $TMPDIR"
-
-log "THREADS:        $THREADS"
-
-# ============================================================
-# INPUT CHECKS
-# ============================================================
-[[ -s "$R1" ]] || {
-    log "ERROR: Missing R1"
-    exit 1
-}
-
-[[ -s "$R2" ]] || {
-    log "ERROR: Missing R2"
-    exit 1
-}
-
-[[ -s "$RAW_CONTIGS" ]] || {
-    log "ERROR: Missing Tiara prok.fa"
-    exit 1
-}
-
-[[ -s "$RAW_C2C" ]] || {
-    log "ERROR: Missing CAT contig2classification"
-    exit 1
-}
-
-[[ -d "$CAT_TAX" ]] || {
-    log "ERROR: Missing CAT taxonomy"
-    exit 1
-}
-
-# ============================================================
-# CLEAN CURRENT OUTPUT
-# ============================================================
-rm -rf "$OUTDIR"
-
-mkdir -p "$OUTDIR" "$TMPDIR"
-
-touch "$DUMMY_U2C"
-
-# ============================================================
-# CLEAN FASTA HEADERS
-# ============================================================
-log "Cleaning FASTA headers"
-
-awk '
-/^>/ {
-    sub(/^>/,"")
-    split($0,a," ")
-    print ">"a[1]
-    next
-}
-{print}
-' \
-"$RAW_CONTIGS" \
-> "$CONTIGS"
-
-# ============================================================
-# CLEAN contig2classification
-# ============================================================
-log "Cleaning contig2classification"
-
-awk '
-BEGIN{FS=OFS="\t"}
-
-/^#/ {
-    print
-    next
-}
-
-{
-    split($1,a," ")
-
-    $1=a[1]
-
-    print
-}
-' \
-"$RAW_C2C" \
-> "$CAT_C2C"
-
-# ============================================================
-# VALIDATE CLEAN FILES
-# ============================================================
-[[ -s "$CONTIGS" ]] || {
-    log "ERROR: Failed to create cleaned prok contigs"
-    exit 1
-}
-
-[[ -s "$CAT_C2C" ]] || {
-    log "ERROR: Failed to create cleaned contig2classification"
-    exit 1
-}
-
-# ============================================================
-# RUN RAT
-# ============================================================
-log "Running RAT (prok)"
-
-"$CAT_CMD" reads \
-    --mode cr \
-    -c "$CONTIGS" \
-    --c2c "$CAT_C2C" \
-    --u2c "$DUMMY_U2C" \
-    -1 "$R1" \
-    -2 "$R2" \
-    -t "$CAT_TAX" \
-    -o "$PREFIX" \
-    --tmpdir "$TMPDIR" \
-    --read2classification \
-    --force \
-    --nproc "$THREADS" \
-    2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-# ============================================================
-# VALIDATE OUTPUT
-# ============================================================
-[[ -s "${PREFIX}.RAT.read2classification.txt" ]] || {
-    log "ERROR: Missing read2classification output"
-    exit 1
-}
-
-[[ -s "${PREFIX}.RAT.complete.abundance.txt" ]] || {
-    log "ERROR: Missing complete abundance output"
-    exit 1
-}
-
-[[ -s "${PREFIX}.RAT.contig.abundance.txt" ]] || {
-    log "ERROR: Missing contig abundance output"
-    exit 1
-}
-
-# ============================================================
-# OUTPUT SUMMARY
-# ============================================================
-log "Generated outputs:"
-
-ls -lh "$OUTDIR"/*.RAT.* || true
-
-# ============================================================
-# CLEANUP
-# ============================================================
-rm -f "$DUMMY_U2C"
-
-log "Finished RAT for $SAMPLE"
-
-;;
-
-# ============================================================
-### CAT (CONTIG-LEVEL — TIARA EUKARYOTIC CONTIGS)
-# ============================================================
-cat_contigs)
-
-set -euo pipefail
-shopt -s nullglob
-
-log "Starting CAT (contig-level, euk)"
-
-THREADS="${THREADS:-16}"
-TARGET_SAMPLE="${TARGET_SAMPLE:-}"
-
-TIARA_DIR="$OUTPUT_DIR/tiara"
-CAT_DIR="$OUTPUT_DIR/cat_contigs"
-LOG_DIR="$OUTPUT_DIR/logs/cat_contigs"
-
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
-CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
-CAT_CMD="${CAT_CMD:-CAT_pack}"
-
-mkdir -p "$CAT_DIR" "$LOG_DIR"
-
-# -------------------- DEPENDENCY CHECK --------------------
-command -v "$CAT_CMD" >/dev/null || { log "ERROR: CAT_pack not found"; exit 1; }
-command -v diamond >/dev/null || { log "ERROR: DIAMOND not found"; exit 1; }
-
-# ============================================================
-# FUNCTION TO PROCESS ONE SAMPLE
-# ============================================================
-run_cat() {
-
-    local SAMPLE="$1"
-    local COND="$TIARA_DIR/$SAMPLE"
-
-    CONTIGS="$COND/euk.fa"
-    OUTDIR="$CAT_DIR/$SAMPLE"
-    PREFIX="$OUTDIR/${SAMPLE}"
-
-    log "----------------------------------------"
-    log "Processing: $SAMPLE"
-
-    [[ -s "$CONTIGS" ]] || {
-        log "No euk.fa → skip"
-        return
-    }
-
-    # -------------------- SKIP IF DONE --------------------
-    if [[ -s "${PREFIX}.contigs2classification.txt" && "${FORCE:-0}" != "1" ]]; then
-        log "Already done → skipping"
-        return
-    fi
-
-    # -------------------- CLEAN --------------------
-    rm -rf "$OUTDIR"
-    mkdir -p "$OUTDIR"
-
-    # -------------------- RUN CAT --------------------
-    log "Running CAT_pack"
-
-    "$CAT_CMD" contigs \
-        -c "$CONTIGS" \
-        -d "$CAT_DB" \
-        -t "$CAT_TAX" \
-        -o "$PREFIX" \
-        --nproc "$THREADS" \
-        2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-    [[ -s "${PREFIX}.contigs2classification.txt" ]] || {
-        log "ERROR: CAT failed"
-        exit 1
-    }
-
-    log "Finished: $SAMPLE"
-}
-
-# ============================================================
-# MODE SELECTION
-# ============================================================
-
-# -------------------- MANUAL MODE --------------------
-if [[ -n "$TARGET_SAMPLE" ]]; then
-    log "Manual mode → $TARGET_SAMPLE"
-    run_cat "$TARGET_SAMPLE"
-
-# -------------------- ARRAY MODE --------------------
-elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-
-    mapfile -t SAMPLES < <(
-        for d in "$TIARA_DIR"/*; do
-            [[ -d "$d" ]] || continue
-            [[ -s "$d/euk.fa" ]] && basename "$d"
-        done | sort
-    )
-
-    N=${#SAMPLES[@]}
-
-    if (( SLURM_ARRAY_TASK_ID > N )); then
-        log "No sample → exiting"
-        exit 0
-    fi
-
-    SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-    run_cat "$SAMPLE"
-
-# -------------------- AUTO MODE (RUN ONLY MISSING) --------------------
-else
-    log "Auto mode → running only missing samples"
-
-    for d in "$TIARA_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        SAMPLE=$(basename "$d")
-
-        CONTIGS="$d/euk.fa"
-        PREFIX="$CAT_DIR/$SAMPLE/${SAMPLE}"
-
-        if [[ -s "$CONTIGS" ]] && [[ ! -s "${PREFIX}.contigs2classification.txt" ]]; then
-            run_cat "$SAMPLE"
-        else
-            log "Skipping $SAMPLE (done or no data)"
-        fi
-    done
-fi
-
-log "CAT step completed"
-;;
-
-# ============================================================
-### CONTIG LENGTH EXTRACTION (TIARA EUK CONTIGS)
-# ============================================================
-contig_lengths)
-
-set -euo pipefail
-shopt -s nullglob
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-log "Starting contig length extraction"
-
-THREADS="${THREADS:-4}"
-TARGET_SAMPLE="${TARGET_SAMPLE:-}"
-FORCE="${FORCE:-0}"
-
-TIARA_DIR="$OUTPUT_DIR/tiara"
-LEN_DIR="$OUTPUT_DIR/contig_lengths"
-LOG_DIR="$OUTPUT_DIR/logs/contig_lengths"
-
-mkdir -p "$LEN_DIR" "$LOG_DIR"
-
-# ============================================================
-# LOAD CONDA ENVIRONMENT (SEQKIT)
-# ============================================================
-
-log "Loading conda environment (seqkit)"
-
-# Initialize conda (important on HPC)
-source /staging/leuven/stg_00100/Rodgee/miniforge3/etc/profile.d/conda.sh
-
-# Activate environment
-conda activate seqkit_env
-
-# Check
-command -v seqkit >/dev/null || { log "ERROR: seqkit not found in conda env"; exit 1; }
-
-log "Using seqkit: $(which seqkit)"
-
-# -------------------- DEPENDENCY CHECK --------------------
-command -v seqkit >/dev/null || { log "ERROR: seqkit not found"; exit 1; }
-
-# ============================================================
-# FUNCTION TO PROCESS ONE SAMPLE
-# ============================================================
-run_lengths() {
-
-    local SAMPLE="$1"
-    local COND="$TIARA_DIR/$SAMPLE"
-
-    CONTIGS="$COND/euk.fa"
-    OUT="$LEN_DIR/${SAMPLE}_lengths.tsv"
-
-    log "----------------------------------------"
-    log "Processing: $SAMPLE"
-
-    [[ -s "$CONTIGS" ]] || {
-        log "No euk.fa → skip"
-        return
-    }
-
-    # -------------------- SKIP IF DONE --------------------
-    if [[ -s "$OUT" && "$FORCE" != "1" ]]; then
-        log "Already done → skipping"
-        return
-    fi
-
-    # -------------------- EXTRACT LENGTHS --------------------
-    log "Extracting contig lengths"
-
-    (
-        echo -e "contig\tlength"
-        seqkit fx2tab -n -l "$CONTIGS"
-    ) > "$OUT.tmp"
-
-    # -------------------- SAFE WRITE --------------------
-    if [[ -s "$OUT.tmp" ]]; then
-        mv "$OUT.tmp" "$OUT"
-        log "Created: $OUT"
-    else
-        log "ERROR: Failed to generate length file"
-        rm -f "$OUT.tmp"
+        log "ERROR: Task ID ${SLURM_ARRAY_TASK_ID} out of range (1-$N)"
         exit 1
     fi
-}
 
-# ============================================================
-# MODE SELECTION
-# ============================================================
+    # -------------------- SELECT SAMPLE --------------------
 
-# -------------------- MANUAL MODE --------------------
-if [[ -n "$TARGET_SAMPLE" ]]; then
-    log "Manual mode → $TARGET_SAMPLE"
-    run_lengths "$TARGET_SAMPLE"
+    SAMPLE_DIR="${SAMPLE_DIRS[$((SLURM_ARRAY_TASK_ID-1))]}"
+    SAMPLE=$(basename "$SAMPLE_DIR")
 
-# -------------------- ARRAY MODE --------------------
-elif [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
+    log "Array task: ${SLURM_ARRAY_TASK_ID} / $N"
 
-    mapfile -t SAMPLES < <(
-        for d in "$TIARA_DIR"/*; do
-            [[ -d "$d" ]] || continue
-            [[ -s "$d/euk.fa" ]] && basename "$d"
-        done | sort
-    )
+    run_rat_prok "$SAMPLE"
 
-    N=${#SAMPLES[@]}
-
-    if (( SLURM_ARRAY_TASK_ID > N )); then
-        log "No sample → exiting"
-        exit 0
-    fi
-
-    SAMPLE="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-    run_lengths "$SAMPLE"
-
-# -------------------- AUTO MODE --------------------
-else
-    log "Auto mode → processing all samples"
-
-    for d in "$TIARA_DIR"/*; do
-        [[ -d "$d" ]] || continue
-
-        SAMPLE=$(basename "$d")
-        run_lengths "$SAMPLE"
-    done
 fi
 
-log "Contig length extraction completed"
-;;
+log "RAT prokaryotic read-level step completed"
 
-# ============================================================
-### CAT (CONTIG-LEVEL — TIARA MITOCHONDRIAL CONTIGS)
-# ============================================================
-cat_mito_contigs)
-
-set -euo pipefail
-shopt -s nullglob
-
-log "Starting CAT (mitochondrial contigs) step"
-
-THREADS="${THREADS:-16}"
-
-TIARA_DIR="$OUTPUT_DIR/tiara"
-CAT_DIR="$OUTPUT_DIR/cat_mito"
-LOG_DIR="$OUTPUT_DIR/logs/cat_mito"
-
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
-CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
-CAT_CMD="${CAT_CMD:-CAT_pack}"
-
-mkdir -p "$CAT_DIR" "$LOG_DIR"
-
-# -------------------- DEPENDENCY CHECK --------------------
-command -v "$CAT_CMD" >/dev/null || { log "ERROR: CAT_pack not found"; exit 1; }
-command -v diamond >/dev/null || { log "ERROR: DIAMOND not found"; exit 1; }
-
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t SAMPLES < <(
-    for d in "$TIARA_DIR"/*; do
-        [[ -d "$d" ]] || continue
-        [[ -s "$d/mito.fa" ]] && echo "$d"
-    done | sort
-)
-
-N=${#SAMPLES[@]}
-log "Samples with mito contigs: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No mito.fa found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample for this array index → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-COND="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$COND")
-
-CONTIGS="$COND/mito.fa"
-OUTDIR="$CAT_DIR/$SAMPLE"
-PREFIX="$OUTDIR/${SAMPLE}_mito"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE"
-log "Input (mito): $CONTIGS"
-
-# -------------------- SKIP --------------------
-if [[ -s "${PREFIX}.contigs2classification.txt" && "${FORCE:-0}" != "1" ]]; then
-    log "CAT already done → skipping"
-    exit 0
-fi
-
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR"
-
-# -------------------- RUN CAT --------------------
-log "Running CAT_pack (mito contigs)"
-
-"$CAT_CMD" contigs \
-    -c "$CONTIGS" \
-    -d "$CAT_DB" \
-    -t "$CAT_TAX" \
-    -o "$PREFIX" \
-    --nproc "$THREADS" \
-    2>&1 | tee "$LOG_DIR/${SAMPLE}_mito.log"
-
-# -------------------- VALIDATE --------------------
-[[ -s "${PREFIX}.contigs2classification.txt" ]] || {
-    log "ERROR: CAT failed"
-    exit 1
-}
-
-log "Finished CAT (mito) for $SAMPLE"
-;;
-
-# ============================================================
-### BAT (BIN-LEVEL — REMAG BINS)
-# ============================================================
-
-bat_bins)
-
-set -euo pipefail
-shopt -s nullglob
-
-log "Starting BAT (bin-level) step"
-
-THREADS="${THREADS:-16}"
-
-REMAG_DIR="$OUTPUT_DIR/remag"
-BAT_DIR="$OUTPUT_DIR/bat_bins"
-LOG_DIR="$OUTPUT_DIR/logs/bat_bins"
-
-CAT_DB="${CAT_DB:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/db}"
-CAT_TAX="${CAT_TAX:-/staging/leuven/stg_00100/Rodgee/databases/CAT/20241212_CAT_nr_website/tax}"
-CAT_CMD="${CAT_CMD:-CAT_pack}"
-
-mkdir -p "$BAT_DIR" "$LOG_DIR"
-
-# -------------------- DEPENDENCY CHECK --------------------
-command -v "$CAT_CMD" >/dev/null || { log "ERROR: CAT_pack not found"; exit 1; }
-command -v diamond >/dev/null || { log "ERROR: DIAMOND not found"; exit 1; }
-
-# -------------------- COLLECT SAMPLES --------------------
-mapfile -t SAMPLES < <(
-    for d in "$REMAG_DIR"/*; do
-        [[ -d "$d" ]] && echo "$d"
-    done | sort
-)
-
-N=${#SAMPLES[@]}
-log "Total samples: $N"
-
-[[ "$N" -gt 0 ]] || { log "ERROR: No reMAG samples found"; exit 1; }
-
-# -------------------- ARRAY CHECK --------------------
-if [[ -z "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    log "ERROR: Run as array job"
-    exit 1
-fi
-
-if (( SLURM_ARRAY_TASK_ID > N )); then
-    log "No sample for this array index → exiting"
-    exit 0
-fi
-
-# -------------------- SELECT SAMPLE --------------------
-SAMPLE_DIR="${SAMPLES[$((SLURM_ARRAY_TASK_ID-1))]}"
-SAMPLE=$(basename "$SAMPLE_DIR")
-
-BINS_DIR="$SAMPLE_DIR/bins"
-OUTDIR="$BAT_DIR/$SAMPLE"
-PREFIX="$OUTDIR/${SAMPLE}"
-
-log "----------------------------------------"
-log "Processing: $SAMPLE"
-log "Bins dir: $BINS_DIR"
-
-# -------------------- CHECK INPUT --------------------
-if [[ ! -d "$BINS_DIR" ]] || ! compgen -G "$BINS_DIR/*.fa" > /dev/null; then
-    log "No bins found → skipping"
-    exit 0
-fi
-
-# -------------------- SKIP --------------------
-if [[ -s "${PREFIX}.bin2classification.txt" && "${FORCE:-0}" != "1" ]]; then
-    log "BAT already done → skipping"
-    exit 0
-fi
-
-# -------------------- CLEAN --------------------
-rm -rf "$OUTDIR"
-mkdir -p "$OUTDIR"
-
-# -------------------- RUN BAT --------------------
-log "Running CAT_pack (bins)"
-log "Output prefix: $PREFIX"
-
-"$CAT_CMD" bins \
-    -b "$BINS_DIR" \
-    -d "$CAT_DB" \
-    -t "$CAT_TAX" \
-    -o "$PREFIX" \
-    --bin_suffix .fa \
-    --nproc "$THREADS" \
-    2>&1 | tee "$LOG_DIR/${SAMPLE}.log"
-
-# -------------------- VALIDATE --------------------
-[[ -s "${PREFIX}.bin2classification.txt" ]] || {
-    log "ERROR: BAT failed"
-    exit 1
-}
-
-log "Finished BAT for $SAMPLE"
 ;;
 
 
@@ -7365,6 +11030,7 @@ log "Samples processed successfully: $N_DONE"
 # ============================================================
 
 MERGED="$SUMMARY_DIR/all_samples.taxonomy_structured.tsv"
+MERGED_TMP=$(mktemp "$SUMMARY_DIR/.all_samples.taxonomy_structured.XXXXXX")
 
 log "Creating merged summary table"
 
@@ -7372,6 +11038,7 @@ FIRST=1
 
 for FILE in "$SUMMARY_DIR"/*.taxonomy_structured.tsv; do
 
+    [[ "$FILE" == "$MERGED" ]] && continue
     [[ -s "$FILE" ]] || continue
 
     SAMPLE=$(basename "$FILE" .taxonomy_structured.tsv)
@@ -7389,7 +11056,7 @@ for FILE in "$SUMMARY_DIR"/*.taxonomy_structured.tsv; do
         {
             print sample,$0
         }
-        ' "$FILE" > "$MERGED"
+        ' "$FILE" > "$MERGED_TMP"
 
         FIRST=0
 
@@ -7401,10 +11068,15 @@ for FILE in "$SUMMARY_DIR"/*.taxonomy_structured.tsv; do
         NR>1 {
             print sample,$0
         }
-        ' "$FILE" >> "$MERGED"
+        ' "$FILE" >> "$MERGED_TMP"
     fi
 
 done
+
+if [[ "$FIRST" -eq 1 ]]; then
+    printf 'sample\tbin\tsuperkingdom\tkingdom\tphylum\tclass\torder\tfamily\tgenus\tspecies\n' > "$MERGED_TMP"
+fi
+mv "$MERGED_TMP" "$MERGED"
 
 if [[ -s "$MERGED" ]]; then
 
@@ -7447,7 +11119,7 @@ echo -e "sample\ttaxon\tabundance" > "$OUT"
 for FILE in "$OUTPUT_DIR/cat_contigs_summary"/*.taxonomy_structured.tsv; do
 
     SAMPLE=$(basename "$FILE" .taxonomy_structured.tsv)
-    COV_FILE="$OUTPUT_DIR/coverage/${SAMPLE}.coverage.tsv"
+    COV_FILE="$OUTPUT_DIR/coverage_coverm/${SAMPLE}.coverage.tsv"
 
     [[ -s "$COV_FILE" ]] || {
         log "Skipping $SAMPLE (no coverage file)"
@@ -7529,312 +11201,6 @@ log "Created: $OUT"
 
 ;;
 
-# ============================================================
-# COMPARE INCUBATION BASED ON BINS: TAXONOMY BINS + BUSCO
-# ============================================================
-compare_incubation_full_taxonomy)
-
-set -euo pipefail
-shopt -s nullglob
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-SUMMARY_DIR="$OUTPUT_DIR/bat_bins_summary"
-META="/staging/leuven/stg_00100/Rodgee/caves_data/metadata/biological_metadata.tsv"
-BUSCO="$OUTPUT_DIR/busco_classified/busco_summary.tsv"
-
-OUT_BASE="$OUTPUT_DIR/comparison_incubation/full_taxonomy.tsv"
-OUT_FINAL="$OUTPUT_DIR/comparison_incubation/full_taxonomy_busco.tsv"
-
-mkdir -p "$(dirname "$OUT_BASE")"
-
-# STEP 1: BUILD TAXONOMY TABLE (ONLY IF MISSING)
-if [[ -s "$OUT_BASE" && "${FORCE:-0}" != "1" ]]; then
-    log "Full taxonomy table exists → skipping generation"
-else
-    log "Generating full taxonomy table"
-
-    awk -v meta="$META" '
-    BEGIN {
-        FS="\t"; OFS="\t"
-
-        while ((getline < meta) > 0) {
-            if ($1=="GC_code") continue
-            incubation[$1]=$2
-            samplecode[$1]=$3
-        }
-        close(meta)
-
-        print "sample","sample_code","incubation","bin","superkingdom","kingdom","phylum","class","order","family","genus","species"
-    }
-
-    FNR==1 { next }
-
-    {
-        n = split(FILENAME, a, "/")
-        file = a[n]
-        split(file, b, "\\.")
-        sample = b[1]
-
-        inc  = incubation[sample]
-        code = samplecode[sample]
-
-        if (inc == "") next
-
-        print sample, code, inc, $1, $2, $3, $4, $5, $6, $7, $8, $9
-    }
-    ' "$SUMMARY_DIR"/S*.taxonomy_structured.tsv > "$OUT_BASE"
-
-    log "Created: $OUT_BASE"
-fi
-
-# STEP 2: MERGE BUSCO (STRICT sample|bin MATCH)
-if [[ ! -s "$BUSCO" ]]; then
-    log "WARNING: BUSCO summary not found → skipping merge"
-    exit 0
-fi
-
-if [[ -s "$OUT_FINAL" && "${FORCE:-0}" != "1" ]]; then
-    log "Final taxonomy+BUSCO exists → skipping merge"
-    exit 0
-fi
-
-log "Preparing composite keys for join"
-
-# -------------------- PREP TAX --------------------
-awk '
-NR>1 {
-    sample = $1
-    bin = $4
-
-    # Fix: remove .fa
-    sub(/\.fa$/, "", bin)
-
-    key = sample "|" bin
-
-    print key"\t"$0
-}
-' "$OUT_BASE" \
-| sort -k1,1 > tmp.tax
-
-# -------------------- PREP BUSCO --------------------
-awk '
-NR>1 {
-    sample = $1
-    bin = $2
-
-    key = sample "|" bin
-
-    print key"\t"$3"\t"$4"\t"$5"\t"$6"\t"$7"\t"$8
-}
-' "$BUSCO" \
-| sort -k1,1 > tmp.busco
-
-# JOIN
-
-join -t $'\t' tmp.tax tmp.busco \
-| awk '
-BEGIN {
-    OFS="\t"
-    print "sample","sample_code","incubation","bin","superkingdom","kingdom","phylum","class","order","family","genus","species","completeness","single","duplicated","fragmented","missing","category"
-}
-{
-    # Layout after join:
-    # $1 = key
-    # $2-$13 = taxonomy columns
-    # $14-$19 = BUSCO columns
-
-    sample       = $2
-    sample_code  = $3
-    incubation   = $4
-    bin          = $5
-
-    print sample, sample_code, incubation, bin, \
-          $6,$7,$8,$9,$10,$11,$12,$13, \
-          $14,$15,$16,$17,$18,$19
-}
-' > "$OUT_FINAL"
-
-# -------------------- CLEAN --------------------
-rm -f tmp.tax tmp.busco
-
-log "Created: $OUT_FINAL"
-;;
-
-# ============================================================
-# COMPARISON OF INCUBATION BASED ON BINS: QUAST + BUSCO
-# ============================================================
-compare_incubation_quast_busco)
-
-set -euo pipefail
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-IN="$OUTPUT_DIR/quast/quast_busco_merged.tsv"
-OUT="$OUTPUT_DIR/quast/quast_busco_comparison.tsv"
-
-log "Creating combined comparison (final clean)"
-
-{
-awk '
-BEGIN {
-    FS="\t"; OFS="\t"
-}
-
-NR==1 { next }
-
-{
-    base = $2
-    sub(/-[LS]$/, "", base)
-
-    if ($3=="long") long[base]=$0
-    else if ($3=="short") short[base]=$0
-}
-
-END {
-    for (k in long) {
-        if (k in short) {
-
-            split(long[k], L, "\t")
-            split(short[k], S, "\t")
-
-            # numeric conversion
-            n50_L = L[6]+0; n50_S = S[6]+0
-            len_L = L[5]+0; len_S = S[5]+0
-            comp_L = L[8]+0; comp_S = S[8]+0
-            frag_L = L[9]+0; frag_S = S[9]+0
-            gc_L = L[7]+0; gc_S = S[7]+0
-            cont_L = L[4]+0; cont_S = S[4]+0
-            bins_L = L[11]+0; bins_S = S[11]+0
-
-            # FIX: use IF instead of next
-            if (!(bins_L == 0 && bins_S == 0)) {
-
-                printf "%s\t%s\t%s\t%d\t%d\t%.3f\t%.3f\t%.2f\t%d\t%d\t%d\n",
-                       k,
-                       L[1], S[1],
-                       (n50_L - n50_S),
-                       (len_L - len_S),
-                       (comp_L - comp_S),
-                       (frag_L - frag_S),
-                       (gc_L - gc_S),
-                       (cont_L - cont_S),
-                       bins_L, bins_S
-            }
-        }
-    }
-}
-' "$IN" | sort
-} | awk '
-BEGIN {
-    OFS="\t"
-    print "sample_code",
-          "long_sample","short_sample",
-          "delta_N50","delta_length",
-          "delta_completeness","delta_fragmented",
-          "delta_GC","delta_contigs",
-          "long_bins","short_bins"
-}
-{ print }
-' > "$OUT"
-
-log "Created: $OUT"
-
-;;
-
-# ============================================================
-# COMPARISON BASED ON BINS : QUAST + BUSCO + COVERAGE
-# ============================================================
-compare_incubation_full)
-
-set -euo pipefail
-
-log() { echo "[$(date '+%F %T')] $*"; }
-
-QB="$OUTPUT_DIR/quast/quast_busco_merged.tsv"
-COV="$OUTPUT_DIR/coverage/coverage_per_sample.tsv"
-OUT="$OUTPUT_DIR/quast/full_comparison_quast_busco_cov.tsv"
-
-log "Creating full comparison (FINAL CLEAN)"
-
-# -------------------- PREP --------------------
-tail -n +2 "$QB"  | sort -k1,1 > tmp.qb
-tail -n +2 "$COV" | sort -k1,1 > tmp.cov
-
-# explicit join (correct columns)
-join -t $'\t' \
--o 1.1,1.2,1.3,1.4,1.5,1.6,1.7,1.8,1.9,1.10,1.11,2.2,2.3,2.4 \
-tmp.qb tmp.cov > tmp.all
-
-# -------------------- BUILD TABLE --------------------
-awk '
-BEGIN {
-    FS="\t"; OFS="\t"
-}
-
-{
-    code = $2
-    incub = $3
-
-    base = code
-    sub(/-[LS]$/, "", base)
-
-    if (incub=="long")  long[base]=$0
-    if (incub=="short") short[base]=$0
-}
-
-END {
-
-    for (k in long) {
-        if (k in short) {
-
-            split(long[k], L, "\t")
-            split(short[k], S, "\t")
-
-            # parse
-            n50_L=L[6]+0; n50_S=S[6]+0
-            len_L=L[5]+0; len_S=S[5]+0
-            comp_L=L[8]+0; comp_S=S[8]+0
-            frag_L=L[9]+0; frag_S=S[9]+0
-            bins_L=L[11]+0; bins_S=S[11]+0
-            cov_tot_L=L[12]+0; cov_tot_S=S[12]+0
-            cov_mean_L=L[14]+0; cov_mean_S=S[14]+0
-
-            if (bins_L==0 && bins_S==0) continue
-
-            printf "%s\t%s\t%s\t%d\t%d\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.3f\t%.3f\t%.0f\t%.0f\t%d\t%d\t%.3f\t%.3f\t%.3f\t%.0f\t%d\n",
-                   k,
-                   L[1], S[1],
-                   n50_L, n50_S,
-                   len_L, len_S,
-                   comp_L, comp_S,
-                   frag_L, frag_S,
-                   bins_L, bins_S,
-                   cov_mean_L, cov_mean_S,
-                   cov_tot_L, cov_tot_S,
-                   (n50_L-n50_S),
-                   (len_L-len_S),
-                   (comp_L-comp_S),
-                   (frag_L-frag_S),
-                   (cov_mean_L-cov_mean_S),
-                   (cov_tot_L-cov_tot_S),
-                   (bins_L-bins_S)
-        }
-    }
-}
-' tmp.all | sort > tmp.body
-
-# -------------------- ADD HEADER (AFTER SORT) --------------------
-{
-echo -e "sample_code\tlong_sample\tshort_sample\tlong_N50\tshort_N50\tlong_length\tshort_length\tlong_completeness\tshort_completeness\tlong_fragmented\tshort_fragmented\tlong_bins\tshort_bins\tlong_mean_cov\tshort_mean_cov\tlong_total_cov\tshort_total_cov\tdelta_N50\tdelta_length\tdelta_completeness\tdelta_fragmented\tdelta_mean_cov\tdelta_total_cov\tdelta_bins"
-cat tmp.body
-} > "$OUT"
-
-rm -f tmp.qb tmp.cov tmp.all tmp.body
-
-log "Created: $OUT"
-
-;;
 
 # ============================================================
 # DEFAULT

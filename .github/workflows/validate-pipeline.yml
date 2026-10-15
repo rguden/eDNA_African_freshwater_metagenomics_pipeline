@@ -1,0 +1,19 @@
+name: Validate pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n eDNA_African_freshwater_metagenomics_pipeline.sh
+      - name: Test summary outputs with synthetic data
+        run: python3 -m unittest discover -s tests -v
